@@ -107,28 +107,8 @@ class PL_RoMa(pl.LightningModule):
         
         # 计算几何误差 (如果有真值单应矩阵)
         if 'T_0to1' in batch and 'mkpts0_f' in data and len(data['mkpts0_f']) > 0:
-            # 计算单应矩阵误差
-            epi_errs = []
-            for b in range(batch_size):
-                mask_b = data['m_bids'] == b
-                if mask_b.sum() < 4:
-                    epi_errs.extend([float('inf')] * max(1, mask_b.sum().item()))
-                    continue
-                
-                mkpts0_b = data['mkpts0_f'][mask_b]
-                mkpts1_b = data['mkpts1_f'][mask_b]
-                H_gt = batch['T_0to1'][b].cpu().numpy()
-                
-                # 计算对称对极误差
-                errs = compute_symmetrical_epipolar_errors(
-                    mkpts0_b.cpu().numpy(), 
-                    mkpts1_b.cpu().numpy(), 
-                    H_gt, 
-                    H_gt
-                )
-                epi_errs.extend(errs.tolist())
-            
-            data['epi_errs'] = torch.tensor(epi_errs, device=data['mkpts0_f'].device)
+            # 调用 metrics.py 中的函数计算误差 (针对 MultiModal 会计算单应重投影误差)
+            compute_symmetrical_epipolar_errors(data)
             
             # 计算 AUC 指标
             auc_metrics = self._compute_auc_metrics(data['epi_errs'])

@@ -455,6 +455,9 @@ def main():
         devices=_n_gpus if _n_gpus > 0 else "auto"
     )
 
+    loguru_logger.info(f"开始训练前先运行一次完整的验证...")
+    trainer.validate(model, datamodule=data_module)
+
     loguru_logger.info(f"开始训练 RoMa: {args.name} (模式: {args.mode})")
     trainer.fit(model, datamodule=data_module)
 
