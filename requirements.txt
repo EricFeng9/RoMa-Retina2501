@@ -8,7 +8,7 @@ loguru
 tqdm
 matplotlib
 h5py
-wandb
+#wandb
 timm
 poselib
 fused-local-corr>=0.2.2

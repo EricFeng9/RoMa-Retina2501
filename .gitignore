@@ -10,3 +10,4 @@ jobs/*
 *.pth
 wandb*
 results/*
+data/*
