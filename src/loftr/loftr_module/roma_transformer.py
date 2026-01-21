@@ -35,6 +35,9 @@ class AnatomicalBiasedAttention(nn.Module):
         Returns:
             out: [B, N_q, D]
             attn: [B, N_heads, N_q, N_k]
+        
+        注意：按照图片要求，在 Attention Matrix 中使用加性偏置 (Additive Bias)。
+        不在 Backbone 拼接 image0 和 mask0，而是在这里通过加性偏置引导注意力。
         """
         B, N_q, D = query.shape
         N_k = key.shape[1]
@@ -47,7 +50,8 @@ class AnatomicalBiasedAttention(nn.Module):
         # 计算注意力分数
         scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_head)  # [B, H, N_q, N_k]
         
-        # 加入血管偏置 (Additive Bias)
+        # 加入血管偏置 (Additive Bias) - 按照图片要求
+        # 公式: scores = scores + λ * vessel_bias
         if vessel_bias is not None:
             # vessel_bias: [B, N_q, N_k] -> [B, 1, N_q, N_k] (broadcast across heads)
             scores = scores + self.lambda_vessel * vessel_bias.unsqueeze(1)

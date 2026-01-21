@@ -51,27 +51,25 @@ class PL_RoMa(pl.LightningModule):
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure, **kwargs):
         """自定义优化器步骤：实现课程学习"""
         # 课程学习：动态调整 lambda_vessel
-        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'lambda_vessel'):
-            total_epochs = self.trainer.max_epochs
+        # 阶段1 (前25 epoch): lambda = 0 (全图感知)
+        # 阶段2 (25-50 epoch): lambda = 0.2 (软掩码引导)
+        # 阶段3 (50 epoch以后): lambda = 0.05 (精度冲刺)
+        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'layers'):
             current_epoch = self.current_epoch
             
-            # 阶段1 (前20%): lambda = 0 (全图感知)
-            if current_epoch < total_epochs * 0.2:
+            if current_epoch < 25:
                 lambda_vessel = 0.0
-            # 阶段2 (中间50%): lambda = 0.5 (软掩码)
-            elif current_epoch < total_epochs * 0.7:
-                lambda_vessel = 0.5
-            # 阶段3 (最后30%): lambda = 1.0 (强化血管)
+            elif current_epoch < 50:
+                lambda_vessel = 0.2
             else:
-                lambda_vessel = 1.0
+                lambda_vessel = 0.05
             
-            # 动态更新 (如果 Transformer 层支持)
-            if hasattr(self.model.transformer, 'layers'):
-                for layer in self.model.transformer.layers:
-                    if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'lambda_vessel'):
-                        layer.self_attn.lambda_vessel = lambda_vessel
-                    if hasattr(layer, 'cross_attn') and hasattr(layer.cross_attn, 'lambda_vessel'):
-                        layer.cross_attn.lambda_vessel = lambda_vessel
+            # 动态更新所有 Transformer 层的 lambda_vessel
+            for layer in self.model.transformer.layers:
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'lambda_vessel'):
+                    layer.self_attn.lambda_vessel = lambda_vessel
+                if hasattr(layer, 'cross_attn') and hasattr(layer.cross_attn, 'lambda_vessel'):
+                    layer.cross_attn.lambda_vessel = lambda_vessel
         
         # 执行优化步骤
         optimizer.step(closure=optimizer_closure)
@@ -93,6 +91,14 @@ class PL_RoMa(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         """验证步骤"""
+        # 验证/测试时关闭血管分割图的注意力偏置（lambda=0）
+        if hasattr(self.model, 'transformer') and hasattr(self.model.transformer, 'layers'):
+            for layer in self.model.transformer.layers:
+                if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'lambda_vessel'):
+                    layer.self_attn.lambda_vessel = 0.0
+                if hasattr(layer, 'cross_attn') and hasattr(layer.cross_attn, 'lambda_vessel'):
+                    layer.cross_attn.lambda_vessel = 0.0
+        
         # 前向传播
         data = self.model(batch)
         
@@ -102,7 +108,7 @@ class PL_RoMa(pl.LightningModule):
         batch_size = batch['image0'].shape[0]
         
         # 总是尝试估计单应矩阵，即使没有足够的匹配点
-        H_est_list = self._estimate_homography_batch(data, batch_size)
+        H_est_list = self._estimate_homography_batch(data, batch, batch_size)
         data['H_est'] = H_est_list
         
         # 计算几何误差 (如果有真值单应矩阵)
@@ -140,7 +146,7 @@ class PL_RoMa(pl.LightningModule):
         """验证周期结束时清空缓存"""
         self.validation_step_outputs.clear()
     
-    def _estimate_homography_batch(self, data, batch_size):
+    def _estimate_homography_batch(self, data, batch, batch_size):
         """
         使用 RANSAC 估计单应矩阵
         Args:
@@ -148,6 +154,7 @@ class PL_RoMa(pl.LightningModule):
                 - 'mkpts0_f': [M, 2]
                 - 'mkpts1_f': [M, 2]
                 - 'm_bids': [M]
+            batch: dict with images for mask calculation
             batch_size: int, 实际的 batch size
         Returns:
             H_list: list of [3, 3] numpy arrays, 长度为 batch_size
@@ -218,6 +225,9 @@ class PL_RoMa(pl.LightningModule):
         """
         import numpy as np
         
+        if len(pts0) == 0:
+            return np.empty((0, 2)), np.empty((0, 2))
+
         H, W = img_size
         cell_h = H / grid_size
         cell_w = W / grid_size
@@ -233,13 +243,14 @@ class PL_RoMa(pl.LightningModule):
         
         for i in range(grid_size):
             for j in range(grid_size):
-                mask = (grid_y == i) & (grid_x == j)
-                if mask.sum() == 0:
+                in_grid = (grid_y == i) & (grid_x == j)
+                if in_grid.sum() == 0:
                     continue
                 
                 # 随机选取 top_k 个点
-                indices = np.where(mask)[0]
+                indices = np.where(in_grid)[0]
                 if len(indices) > top_k:
+                    # 如果有置信度信息，按置信度取 top_k 会更好，但这里没有置信度输入，先用随机
                     indices = np.random.choice(indices, top_k, replace=False)
                 
                 pts0_binned.append(pts0[indices])

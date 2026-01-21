@@ -77,10 +77,12 @@ class RoMaLoss(nn.Module):
             anchor_probs: [B, N0, K] 预测的锚点概率分布
             data: dict with keys:
                 - 'T_0to1': [B, 3, 3] 真值变换矩阵
-                - 'vessel_weight0': [B, 1, H, W] 血管权重 (可选)
+                - 'mask0': [B, 1, H, W] 血管掩码 (可选)
         Returns:
             loss_c: scalar
             metrics: dict
+        
+        注意：按照图片要求，使用 torch.clamp(mask, min=0.1) 作为损失权重系统。
         """
         B, N0, K = anchor_probs.shape
         H = W = int(np.sqrt(N0))
@@ -112,17 +114,19 @@ class RoMaLoss(nn.Module):
         kl_loss = F.kl_div(log_probs, gt_anchor_dist, reduction='none').sum(dim=-1)  # [B, N0]
         
         # 梯度保底：引入血管权重
-        if 'vessel_weight0' in data:
-            vessel_weight = data['vessel_weight0'].squeeze(1)  # [B, H, W]
+        # 按照图片要求，使用 torch.clamp(mask, min=0.1) 作为损失权重系统
+        if 'mask0' in data:
+            vessel_mask = data['mask0'].squeeze(1)  # [B, H, W]
             # 下采样到粗级分辨率
-            vessel_weight_down = F.interpolate(
-                vessel_weight.unsqueeze(1), size=(H, W), 
+            vessel_mask_down = F.interpolate(
+                vessel_mask.unsqueeze(1), size=(H, W), 
                 mode='bilinear', align_corners=False
             ).squeeze(1)  # [B, H, W]
-            vessel_weight_flat = vessel_weight_down.reshape(B, -1)  # [B, N0]
+            vessel_mask_flat = vessel_mask_down.reshape(B, -1)  # [B, N0]
             
-            # 梯度保底: max(W_vessel, epsilon)
-            loss_weight = torch.clamp(vessel_weight_flat, min=self.epsilon)
+            # 梯度保底: torch.clamp(mask, min=0.1)
+            # 即使是非血管区域，也保留 0.1 的权重，确保模型能学习全图的大尺度旋转信息
+            loss_weight = torch.clamp(vessel_mask_flat, min=self.epsilon)
         else:
             loss_weight = torch.ones_like(kl_loss)
         
@@ -199,11 +203,13 @@ class RoMaLoss(nn.Module):
                 - 'mkpts0_f': [M, 2]
                 - 'mkpts1_f': [M, 2]
                 - 'T_0to1': [B, 3, 3]
-                - 'vessel_weight0': [B, 1, H, W] (optional)
+                - 'mask0': [B, 1, H, W] (optional) 血管掩码
                 - 'm_bids': [M]
         Returns:
             loss: scalar
             metrics: dict
+        
+        注意：按照图片要求，使用 torch.clamp(mask, min=0.1) 实现梯度保底。
         """
         # 粗级损失
         loss_c, metrics_c = self.compute_coarse_loss(data['anchor_probs'], data)

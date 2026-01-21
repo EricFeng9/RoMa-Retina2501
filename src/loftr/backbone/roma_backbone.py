@@ -69,9 +69,12 @@ class CoarseEncoder(nn.Module):
         """
         Args:
             x: [B, 1, H, W] 灰度图
-            vessel_mask: [B, 1, H, W] 血管掩码（可选）
+            vessel_mask: [B, 1, H, W] 血管掩码（不在此处使用，仅为接口兼容）
         Returns:
             feat: [B, C, H_patch, W_patch] 粗特征
+        
+        注意：按照图片要求，不在 Backbone 中拼接掩码，保持特征纯净性。
+        掩码将在 Transformer 的注意力机制中通过加性偏置引入。
         """
         # 模态适配
         x_adapted = self.adapter(x)
@@ -111,9 +114,12 @@ class FineEncoder(nn.Module):
         """
         Args:
             x: [B, 1, H, W] 灰度图
+            vessel_mask: [B, 1, H, W] 血管掩码（不在此处使用，仅为接口兼容）
         Returns:
             feat_coarse: [B, 256, H/4, W/4] 粗级特征
             feat_fine: [B, 128, H/4, W/4] 精级特征
+        
+        注意：不在 Backbone 中拼接掩码，保持特征纯净性。
         """
         # VGG 期望 3 通道输入
         if x.shape[1] == 1:
@@ -154,17 +160,20 @@ class RoMaBackbone(nn.Module):
         """
         Args:
             x: [B, 1, H, W] 灰度图
-            vessel_mask: [B, 1, H, W] 血管掩码
+            vessel_mask: [B, 1, H, W] 血管掩码（不在此处使用，仅为接口兼容）
         Returns:
             feat_c: [B, D, H/8, W/8] 粗特征
             feat_f: [B, d, H/4, W/4] 精特征
-        """
-        # 精特征 (VGG19)
-        feat_coarse_vgg, feat_fine = self.fine_encoder(x, vessel_mask)
         
-        # 粗特征 (DINOv2 或 VGG)
+        注意：按照图片要求，不在 Backbone 中拼接掩码。
+        Backbone 只负责提取纯净的图像特征，掩码将在 Transformer 的注意力机制中使用。
+        """
+        # 精特征 (VGG19) - 不传入 vessel_mask
+        feat_coarse_vgg, feat_fine = self.fine_encoder(x, None)
+        
+        # 粗特征 (DINOv2 或 VGG) - 不传入 vessel_mask
         if self.coarse_encoder is not None:
-            feat_coarse_dino = self.coarse_encoder(x, vessel_mask)
+            feat_coarse_dino = self.coarse_encoder(x, None)
             # 统一分辨率：将 VGG 粗特征对齐到 DINOv2 的 Patch 分辨率 (如 37x37)
             # 这样做可以减小 Transformer 的序列长度，防止 vessel_bias 矩阵过大导致 OOM
             if feat_coarse_vgg.shape[2:] != feat_coarse_dino.shape[2:]:

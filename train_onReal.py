@@ -27,18 +27,23 @@ import torch
 import pytorch_lightning as pl
 from pytorch_lightning.utilities import rank_zero_only
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Callback, EarlyStopping, TQDMProgressBar
 from pytorch_lightning.strategies import DDPStrategy
 import logging
 
 from src.config.default import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
-from data.FIVES_extract.FIVES_extract import MultiModalDataset
 from src.utils.plotting import make_matching_figures
+from data.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
+from data.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
+from data.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
+from data.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
+from torch.utils.data import Dataset
+import torch.nn.functional as F
 
 # 数据集根目录：指向本地 data 目录
-DATA_ROOT = "/data/student/Fengjunming/LoFTR/data/FIVES_extract"  # 保持原路径或按需修改
+DATA_ROOT = "/data/student/Fengjunming/LoFTR/data"
 
 # 配置日志格式
 loguru_logger = get_rank_zero_only_logger(logger)
@@ -84,6 +89,63 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib")
 warnings.filterwarnings("ignore", message=".*main thread is not in main loop.*")
 
+class RealDatasetWrapper(Dataset):
+    """
+    真实数据集包装器：
+    1. 统一不同数据集的返回格式。
+    2. 将血管掩码填充为全1。
+    3. 数据集已经返回fix（原始）和moving_gt（配准后的真值），不需要再施加人工形变。
+    """
+    def __init__(self, dataset, split='train', img_size=518):
+        self.dataset = dataset
+        self.split = split
+        self.img_size = img_size
+        
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        batch = self.dataset[idx]
+        
+        # 现在所有数据集都返回 6 个元素：(fix, moving_orig, moving_gt, fix_path, moving_path, T_0to1)
+        fix_t, moving_original_t, moving_gt_t, fix_path, moving_path, T_0to1 = batch
+            
+        # 统一归一化：将 [-1, 1] 转回 [0, 1]
+        moving_original_t = (moving_original_t + 1.0) / 2.0
+        moving_gt_t = (moving_gt_t + 1.0) / 2.0
+        
+        # Resize 到目标尺寸 (如 518x518)
+        # 注意：这里的 resize 也会改变 T_0to1 的尺度
+        if fix_t.shape[-1] != self.img_size:
+            scale = self.img_size / float(fix_t.shape[-1])
+            T_rescale = torch.eye(3)
+            T_rescale[0, 0] = scale
+            T_rescale[1, 1] = scale
+            T_0to1 = T_rescale @ T_0to1
+
+            fix_t = F.interpolate(fix_t.unsqueeze(0), size=(self.img_size, self.img_size), 
+                                   mode='bilinear', align_corners=False).squeeze(0)
+            moving_original_t = F.interpolate(moving_original_t.unsqueeze(0), size=(self.img_size, self.img_size), 
+                                   mode='bilinear', align_corners=False).squeeze(0)
+            moving_gt_t = F.interpolate(moving_gt_t.unsqueeze(0), size=(self.img_size, self.img_size), 
+                                   mode='bilinear', align_corners=False).squeeze(0)
+            
+        fix = fix_t[0].numpy() # [H, W]
+        moving_original = moving_original_t[0].numpy()  # [H, W] 原始未配准的moving
+        moving_gt = moving_gt_t[0].numpy()  # [H, W] 配准后的真值
+        
+        data = {
+            'image0': torch.from_numpy(fix).float()[None],  # [1, H, W] 固定图
+            'image1': torch.from_numpy(moving_original).float()[None],  # [1, H, W] 原始未配准的moving
+            'image1_gt': torch.from_numpy(moving_gt).float()[None],  # [1, H, W] GT图像用于MSE计算
+            'T_0to1': T_0to1.float(),  # [3, 3] 地面真值变换矩阵
+            'dataset_name': 'RealDataset',
+            'pair_id': idx,
+            'pair_names': (Path(fix_path).name, Path(moving_path).name)
+        }
+            
+        return data
+
 class MultimodalDataModule(pl.LightningDataModule):
     def __init__(self, args, config):
         super().__init__()
@@ -96,13 +158,31 @@ class MultimodalDataModule(pl.LightningDataModule):
         }
 
     def setup(self, stage=None):
+        # 根据模式选择数据集和对应的参数
+        if self.args.mode == 'cffa':
+            dataset_cls = CFFADataset
+            mode_arg = 'fa2cf'
+        elif self.args.mode == 'cfoct':
+            dataset_cls = CFOCTDataset
+            mode_arg = 'cf2oct'
+        elif self.args.mode == 'octfa':
+            dataset_cls = OCTFADataset
+            mode_arg = 'fa2oct'
+        elif self.args.mode == 'cfocta':
+            dataset_cls = CFOCTADataset
+            mode_arg = 'cf2octa'
+        else:
+            raise ValueError(f"Unknown mode: {self.args.mode}")
+
         if stage == 'fit' or stage is None:
-            self.train_dataset = MultiModalDataset(
-                DATA_ROOT, mode=self.args.mode, split='train', 
-                img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
-            self.val_dataset = MultiModalDataset(
-                DATA_ROOT, mode=self.args.mode, split='val', 
-                img_size=self.args.img_size, vessel_sigma=self.args.vessel_sigma)
+            raw_train = dataset_cls(split='train', mode=mode_arg)
+            self.train_dataset = RealDatasetWrapper(
+                raw_train, split='train', img_size=self.args.img_size)
+        
+        if stage in ('fit', 'validate') or stage is None:
+            raw_val = dataset_cls(split='val', mode=mode_arg)
+            self.val_dataset = RealDatasetWrapper(
+                raw_val, split='val', img_size=self.args.img_size)
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
@@ -176,6 +256,11 @@ def create_chessboard(img1, img2, grid_size=4):
     
     return chessboard
 
+class LitProgressBar(TQDMProgressBar):
+    def on_train_epoch_start(self, trainer, pl_module):
+        super().on_train_epoch_start(trainer, pl_module)
+        self.train_progress_bar.set_description(f"Epoch {trainer.current_epoch + 1}")
+
 class RoMaValidationCallback(Callback):
     """RoMa 验证回调：保存图像、计算MSE、管理权重"""
     def __init__(self, args):
@@ -192,6 +277,8 @@ class RoMaValidationCallback(Callback):
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         if trainer.sanity_checking:
             sub_dir = "step0"
+        elif trainer.current_epoch == 0 and not trainer.training:
+            sub_dir = "initial"
         else:
             sub_dir = f"epoch{trainer.current_epoch + 1}"
             
@@ -223,7 +310,13 @@ class RoMaValidationCallback(Callback):
         if not self.epoch_mses:
             return
             
-        epoch = trainer.current_epoch + 1
+        if trainer.current_epoch == 0 and not trainer.training:
+            epoch_name = "Initial"
+            epoch_num = 0
+        else:
+            epoch_num = trainer.current_epoch + 1
+            epoch_name = f"Epoch {epoch_num}"
+            
         metrics = trainer.callback_metrics
         
         avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
@@ -240,7 +333,7 @@ class RoMaValidationCallback(Callback):
                 display_metrics[name] = metrics[k].item()
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        loguru_logger.info(f"Epoch {epoch} 验证总结 >> {metric_str}")
+        loguru_logger.info(f"{epoch_name} 验证总结 >> {metric_str}")
         
         pl_module.log("val_mse", avg_mse, on_epoch=True, prog_bar=False, logger=True)
         
@@ -249,7 +342,7 @@ class RoMaValidationCallback(Callback):
         latest_path.mkdir(exist_ok=True)
         trainer.save_checkpoint(latest_path / "model.ckpt")
         with open(latest_path / "log.txt", "w") as f:
-            f.write(f"Epoch: {epoch}\nLatest MSE: {avg_mse:.6f}")
+            f.write(f"Epoch: {epoch_num}\nLatest MSE: {avg_mse:.6f}")
             
         # 更新最优权重
         if avg_mse < self.best_val_mse:
@@ -258,8 +351,8 @@ class RoMaValidationCallback(Callback):
             best_path.mkdir(exist_ok=True)
             trainer.save_checkpoint(best_path / "model.ckpt")
             with open(best_path / "log.txt", "w") as f:
-                f.write(f"Epoch: {epoch}\nBest MSE: {avg_mse:.6f}")
-            loguru_logger.info(f"发现新的最优模型! Epoch {epoch}, MSE: {avg_mse:.6f}")
+                f.write(f"Epoch: {epoch_num}\nBest MSE: {avg_mse:.6f}")
+            loguru_logger.info(f"发现新的最优模型! {epoch_name}, MSE: {avg_mse:.6f}")
 
     def _save_batch_results(self, trainer, pl_module, batch, outputs, epoch_dir):
         batch_size = batch['image0'].shape[0]
@@ -307,7 +400,7 @@ class RoMaValidationCallback(Callback):
             
             img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            img1_origin = (batch['image1_origin'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+            img1_gt = (batch['image1_gt'][i, 0].cpu().numpy() * 255).astype(np.uint8)
             
             # 保存血管掩码
             if 'mask0' in batch:
@@ -320,7 +413,7 @@ class RoMaValidationCallback(Callback):
             
             H_est = H_ests[i]
             
-            # 配准
+            # 配准：将moving(img1)配准到fix(img0)空间
             h, w = img0.shape
             try:
                 H_inv = np.linalg.inv(H_est)
@@ -329,28 +422,28 @@ class RoMaValidationCallback(Callback):
                 loguru_logger.error(f"样本 {sample_name}: H_est 求逆失败: {e}")
                 img1_result = np.zeros_like(img0)
                 
-            # 计算 MSE
+            # 计算 MSE：在moving_result和moving_gt之间计算
             try:
-                res_f, orig_f = filter_valid_area(img1_result, img1_origin)
-                mask = (res_f > 0)
+                res_f, gt_f = filter_valid_area(img1_result, img1_gt)
+                mask = (res_f > 0) & (gt_f > 0)
                 if np.any(mask):
-                    mse = np.mean(((res_f[mask] / 255.0) - (orig_f[mask] / 255.0)) ** 2)
+                    mse = np.mean(((res_f[mask] / 255.0) - (gt_f[mask] / 255.0)) ** 2)
                 else:
-                    mse = np.mean(((img1_result / 255.0) - (img1_origin / 255.0)) ** 2)
+                    mse = np.mean(((img1_result / 255.0) - (img1_gt / 255.0)) ** 2)
             except:
-                mse = np.mean(((img1_result / 255.0) - (img1_origin / 255.0)) ** 2)
+                mse = np.mean(((img1_result / 255.0) - (img1_gt / 255.0)) ** 2)
             
             mses.append(mse)
             
             # 保存图像
             cv2.imwrite(str(save_path / "fix.png"), img0)
             cv2.imwrite(str(save_path / "moving.png"), img1)
-            cv2.imwrite(str(save_path / "moving_origin.png"), img1_origin)
+            cv2.imwrite(str(save_path / "moving_gt.png"), img1_gt)  # 改为moving_gt
             cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
             
-            # 保存棋盘图
+            # 保存棋盘图：比较moving_result和moving_gt
             try:
-                chessboard = create_chessboard(img1_result, img1_origin)
+                chessboard = create_chessboard(img1_result, img1_gt)
                 cv2.imwrite(str(save_path / "chessboard.png"), chessboard)
             except:
                 pass
@@ -385,37 +478,24 @@ def main():
     loguru_logger.info(f"项目根目录: {root_dir}")
     loguru_logger.info(f"日志将同时保存到: {log_file}")
 
-    # RoMa 专用配置
-    config.defrost() # 解冻配置以允许修改
-    if 'ROMA' not in config:
-        from yacs.config import CfgNode as CN
-        config.ROMA = CN()
+    # --- 关键参数配置区 (可在脚本内直接调整) ---
+    config.defrost()
     
-    config.ROMA.USE_DINOV2 = True
-    config.ROMA.DINOV2_MODEL = 'dinov2_vits14'
-    # 使用你刚才下载好的权重路径
+    # 模型参数
     config.ROMA.DINOV2_PATH = str(root_dir / "pretrained_models" / "dinov2_vits14_pretrain.pth")
-    config.ROMA.D_MODEL = 256
-    config.ROMA.N_HEADS = 8
-    config.ROMA.N_LAYERS = 4
-    config.ROMA.LAMBDA_VESSEL = 1.0
-    config.ROMA.NUM_ANCHORS = 64*64
-    config.ROMA.CONF_THRESH = 0.01
-    config.ROMA.TOP_K = 1000
-    config.ROMA.FINE_WINDOW_SIZE = 5
+    config.ROMA.LAMBDA_VESSEL = 1.0     # 血管增强强度 (真实数据集建议设为 0.0 或较小值，因为掩码是全1)
+    config.ROMA.CONF_THRESH = 0.01      # 匹配点置信度阈值
+    config.ROMA.TOP_K = 1000            # 最多保留匹配点数
     
-    if 'LOSS' not in config.ROMA:
-        from yacs.config import CfgNode as CN
-        config.ROMA.LOSS = CN()
+    # 损失权重
     config.ROMA.LOSS.WEIGHT_COARSE = 1.0
     config.ROMA.LOSS.WEIGHT_FINE = 1.0
-    config.ROMA.LOSS.EPSILON = 0.1
-    config.ROMA.LOSS.SMOOTH_PARAM = 0.01
-    config.ROMA.LOSS.ANCHOR_SIGMA = 0.02
     
+    # 训练参数
     config.DATASET.MGDPT_IMG_RESIZE = args.img_size
     config.TRAINER.SEED = 66
     config.TRAINER.PLOT_MODE = 'evaluation'
+    # ---------------------------------------
     pl.seed_everything(config.TRAINER.SEED)
 
     # GPU 设置
@@ -435,9 +515,10 @@ def main():
     tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=args.name)
     val_callback = RoMaValidationCallback(args)
     lr_monitor = LearningRateMonitor(logging_interval='step')
+    # 早停机制：只在50 epoch后开启，patience=8
     early_stop_callback = EarlyStopping(
         monitor='val_mse', 
-        patience=20,
+        patience=8,
         verbose=True,
         mode='min',
         min_delta=0.0001
@@ -445,10 +526,10 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        min_epochs=20,
+        min_epochs=50,  # 前50 epoch不触发早停
         check_val_every_n_epoch=5,
         num_sanity_val_steps=3,
-        callbacks=[val_callback, lr_monitor, early_stop_callback],
+        callbacks=[val_callback, lr_monitor, early_stop_callback, LitProgressBar()],
         logger=tb_logger,
         strategy=DDPStrategy(find_unused_parameters=False) if _n_gpus > 1 else "auto",
         accelerator="gpu" if _n_gpus > 0 else "cpu",

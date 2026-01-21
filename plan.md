@@ -36,19 +36,19 @@ RoMa 默认使用冻结的 DINOv2 获取粗特征。由于眼底图(CF、OCT、F
 
 * **基础：** 冻结的 DINOv2 (ViT-L/14)
 * **改造：** 在 DINOv2 前添加一个轻量级的 Modality Adapter（如 3×3 卷积层），将不同模态映射到 DINOv2 熟悉的特征空间
-* **血管增强：** 将下采样的 $M^{vessel}$ 与图像特征在通道维度拼接或作为特征偏移量引入
+* **血管增强策略：** **不要**在 Backbone 阶段拼接掩码，而是将掩码 $M^{vessel}$ 传递给 Transformer 的注意力机制中使用。Backbone 只负责提取原始图像特征，保持特征的纯净性。
 
 #### 精特征编码器 $F_{fine}$：
 
 * **选择：** 采用专门的 VGG19。RoMa 的实验证明，VGG19 在精细定位任务中显著优于 ResNet
 
-* **输入：** 图像对 $I^A$ (固定图 CF) 和 $I^B$ (待配准图 OCT/FA)，以及对应的血管分割掩码 $M^{vessel}$。
+* **输入：** 图像对 $I^A$ (固定图 CF) 和 $I^B$ (待配准图 OCT/FA)。血管分割掩码 $M^{vessel}$ 不在此阶段使用。
 * **输出：** 提取两层特征。
 * **粗级特征：** $\tilde{F} \in \mathbb{R}^{\frac{H}{8} \times \frac{W}{8} \times D}$，用于全局匹配。
 * **精级特征：** $\hat{F} \in \mathbb{R}^{\frac{H}{2} \times \frac{W}{2} \times d}$，用于亚像素微调。
 
 * **解剖掩码融合策略：**
-* **关键原则：** 血管掩码信息通过通道拼接或特征偏移量引入，保留全局感知能力，有助于 Transformer 建立正确的全局位置编码。
+* **关键原则：** 血管掩码信息**不在 Backbone 中拼接**，而是在 Transformer 的注意力机制中通过**加性偏置 (Additive Bias)** 引入。这样保留了全局感知能力，同时避免了掩码直接污染特征空间，有助于 Transformer 建立正确的全局位置编码。
 
 
 
@@ -158,44 +158,69 @@ $$\mathcal{L}_{fine} \propto (||W(x^A) - x_{gt}^B||^2 + s)^{1/4}$$
 
 * **问题：** RoMa 生成的是稠密变形场，直接解算矩阵容易受主血管区域干扰。
 * **操作：** 从 RoMa 的稠密输出中，基于置信度 $p(x^A)$ 进行采样。
-* **网格约束：** 在图像的 $8 \times 8$ 个分区中，每个分区只选取置信度最高的 N 个点对，确保匹配点遍布全图，提高放射变换矩阵 $M$ 的稳定性。
+* **网格约束：** 
+  - 将 $518 \times 518$ 的图像划分为 $8 \times 8 = 64$ 个网格分区
+  - 在每个分区中只选取置信度最高的前 5 个匹配点
+  - 确保匹配点遍布全图，提高放射变换矩阵 $M$ 的稳定性
 
 ---
 
 ## 第四阶段：训练策略：解剖课程学习 (Curriculum Learning)
 
-让模型先学“简单的全图对齐”，再学“难的血管对齐”。
+让模型先学"简单的全图对齐"，再学"难的血管对齐"。
 
-* **阶段 1 (前 20% Epochs)：全图感知期**
-  - 不使用血管掩码，或者令 $W_{pair}$ 全为 1。
+* **阶段 1 (前 25 Epochs)：全图感知期**
+  - 设置 $\lambda = 0$，不使用血管掩码偏置。
   - 让模型先利用全图信息学会处理 $\pm 90^\circ$ 的旋转和大尺度偏移。
-* **阶段 2 (中间 50% Epochs)：软掩码引导期**
-  - 引入软掩码加性偏置，设置背景权重（Background Weight）为 0.2。
+* **阶段 2 (25-50 Epochs)：软掩码引导期**
+  - 设置 $\lambda = 0.2$，引入弱的血管掩码加性偏置。
   - 模型开始向血管聚焦，但在非血管区域保留梯度。
-* **阶段 3 (最后 30% Epochs)：精度冲刺期**
-  - 强化血管权重，将背景权重降至 0.05 或使用硬掩码。
+* **阶段 3 (50 Epochs 以后)：精度冲刺期**
+  - 设置 $\lambda = 0.05$，使用更弱的血管权重。
   - 进行最后的精度对齐冲刺。
+  - **早停机制**：只在此阶段开启早停，patience=8。
+
+**验证/测试阶段：**
+- 设置 $\lambda = 0$，完全关闭血管分割图的注意力偏置。
+- 确保模型在纯图像特征下进行推理，避免对掩码的依赖。
 
 ---
 
 ## 第五阶段：配准解算 (Inference & Registration)
 
-模型训练完成后，配准不再是预测变形场，而是解算矩阵：
+模型训练完成后，配准不再是预测变形场，而是解算矩阵。
 
-1. **特征匹配（带掩码过滤）：** 
-   * 输入未对齐的 $I^A, I^B$ 及其血管掩码 $M^{vessel}_A, M^{vessel}_B$。
-   * LoFTR 输出点对集合 $\{(x_k, y_k) \leftrightarrow (x'_k, y'_k)\}$。
-   * **掩码过滤：** 剔除所有不在血管区域内的匹配点，即保留满足 $M^{vessel}_A(x_k, y_k) = 1$ 且 $M^{vessel}_B(x'_k, y'_k) = 1$ 的点对。
+### 推理配置
+
+**重要：验证/测试时关闭血管掩码偏置**
+- 设置 $\lambda = 0$，完全关闭 Transformer 注意力机制中的血管掩码偏置
+- 原因：
+  1. 避免模型对掩码产生依赖，确保在没有精确掩码的真实场景下也能工作
+  2. 测试模型在纯图像特征下的泛化能力
+  3. 课程学习已经让模型学会了血管区域的重要性，推理时不需要显式引导
+
+### 配准流程
+
+1. **特征匹配（$\lambda = 0$）：** 
+   * 输入未对齐的 $I^A, I^B$（掩码 $M^{vessel}$ 在推理时不参与注意力计算）。
+   * RoMa 输出点对集合 $\{(x_k, y_k) \leftrightarrow (x'_k, y'_k)\}$。
+   * 模型依靠训练时学到的特征表示自动关注血管区域。
 
 2. **RANSAC 空间分布约束 (Spatial Binning for RANSAC)：**
    * RoMa 生成的是稠密变形场，直接解算矩阵容易受主血管区域干扰。
    * **操作：** 从 RoMa 的稠密输出中，基于置信度 $p(x^A)$ 进行采样。
-   * **网格约束：** 在图像的 $8 \times 8$ 个分区中，每个分区只选取置信度最高的 N 个点对，确保匹配点遍布全图，提高放射变换矩阵 $M$ 的稳定性。
-   * **理由：** 强制匹配点在空间上散开，能极大提高放射变换矩阵求解的稳定性，防止模型退化为单位矩阵 $I$。
+   * **网格约束：** 
+     - 将 $518 \times 518$ 的图像划分为 $8 \times 8 = 64$ 个网格分区
+     - 在每个分区中只选取置信度最高的前 5 个匹配点
+     - 最多保留 $8 \times 8 \times 5 = 320$ 个匹配点（实际通常更少）
+   * **理由：** 
+     - 强制匹配点在空间上均匀分布，避免集中在血管密集区域
+     - 极大提高放射变换矩阵求解的稳定性和精度
+     - 防止模型退化为单位矩阵 $I$
    * 使用 **RANSAC** 算法剔除误匹配，并求解放射矩阵 $M$ ：
 $$\min_M \sum_k ||M \cdot [x_k, y_k, 1]^T - [x'_k, y'_k, 1]^T||^2$$
 
-3. **大尺度转换处理：** 由于加入了血管结构约束，模型即使在极大旋转角度（±90°）下仍可以依靠血管拓扑对应关系建立准确匹配。RoMa 的 Transformer 解码器在不使用位置编码的情况下非常健壮，能够处理极大尺度的旋转。
+3. **大尺度转换处理：** 由于课程学习的训练策略，模型即使在 $\lambda = 0$ 的情况下，也能在极大旋转角度（±90°）下依靠学到的血管拓扑特征建立准确匹配。RoMa 的 Transformer 解码器在不使用位置编码的情况下非常健壮，能够处理极大尺度的旋转。
 
 4. **重采样：** 利用 $M$ 对 $I^B$ 进行 Warp，完成配准。
 
@@ -274,31 +299,39 @@ def __getitem__(self, idx):
 
 1. **Backbone 输出修改：**
    * **粗特征编码器：** 在冻结的 DINOv2 (ViT-L/14) 前添加 Modality Adapter（3×3 卷积层）
-   * 将血管掩码下采样并与图像特征在通道维度拼接或作为特征偏移量引入
+   * **不要**在 Backbone 中拼接血管掩码，Backbone 只提取纯净的图像特征
    * **精特征编码器：** 使用 VGG19 作为精细定位网络
 
 2. **Transformer 匹配解码器修改：**
    * 实现锚点概率预测（64×64 个锚点）
-   * **解剖偏置实现：**
+   * **解剖偏置实现（在注意力机制中引入掩码）：**
    ```python
    # 相似度计算 (Anatomical Biasing)
-   sim_matrix = compute_attention(Q, K, V)  # RoMa 的注意力计算
-   if use_vessel_bias:
-       # 加性偏置引导，不截断梯度
-       vessel_bias = lambda_weight * (M_vessel_A.unsqueeze(-1) * M_vessel_B.unsqueeze(-2))
-       sim_matrix = sim_matrix + vessel_bias
+   # 在 Transformer 的注意力计算中，不要在 Backbone 拼接 mask0
+   # 而是在 Transformer 的 Attention Matrix 中引入偏置
+   scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_head)  # [B, H, N_q, N_k]
+   
+   # 加性偏置引导，不截断梯度
+   if vessel_bias is not None:
+       # vessel_bias: [B, N_q, N_k] = M_vessel_A.unsqueeze(-1) * M_vessel_B.unsqueeze(-2)
+       scores = scores + lambda_weight * vessel_bias.unsqueeze(1)  # broadcast across heads
+   
+   attn = F.softmax(scores, dim=-1)
    ```
 
 3. **损失函数修改：**
-   * **粗级损失（KL 散度）：**
+   * **粗级损失（KL 散度 + 梯度保底）：**
    ```python
    # 锚点概率分布与真值分布的 KL 散度
    anchor_probs = model.predict_anchor_probs(feat_A, feat_B)
    gt_anchor_dist = create_gt_anchor_distribution(x_gt_B, K=64*64)
-   loss_coarse = F.kl_div(F.log_softmax(anchor_probs, dim=-1), gt_anchor_dist, reduction='none')
+   log_probs = torch.log(anchor_probs + 1e-8)
+   kl_loss = F.kl_div(log_probs, gt_anchor_dist, reduction='none').sum(dim=-1)  # [B, N0]
+   
    # 梯度保底：给背景留 0.1 的权重
-   loss_weight = torch.clamp(W_vessel, min=0.1)
-   loss_coarse = (loss_coarse * loss_weight).mean()
+   # 使用 torch.clamp(mask, min=0.1) 作为损失权重系统
+   loss_weight = torch.clamp(mask, min=0.1)  # [B, N0]
+   loss_coarse = (kl_loss * loss_weight).sum() / (loss_weight.sum() + 1e-8)
    ```
    * **精级损失（Charbonnier）：**
    ```python
@@ -314,10 +347,12 @@ def __getitem__(self, idx):
 | 学习率 | 8e-4 | AdamW 优化器，带 Cosine 衰减 |
 | Batch Size | 4-8 | 取决于 GPU 显存（512×512 图像） |
 | 训练轮数 | 100-200 epochs | 监控验证集匹配精度 |
+| 最小轮数 | 50 epochs | 前50 epoch不触发早停 |
+| 早停 patience | 8 | 验证损失连续8个epoch不改善则停止 |
 | 粗级阈值 | 1.0 (网格单位) | 1/8 分辨率下的距离阈值 |
 | 精级窗口 | $w = 5$ | 5×5 像素窗口 |
-| 血管权重 | $\alpha=2, \beta=0.1$ | 特征加权参数 |
-| 边缘点权重 | 1.5 | 血管边缘关键点的损失权重 |
+| 课程学习 λ | 0 → 0.2 → 0.05 | 阶段1(0-25)→阶段2(25-50)→阶段3(50+) |
+| 验证/测试 λ | 0 | 推理时关闭血管掩码偏置 |
 
 ---
 
@@ -337,13 +372,13 @@ def __getitem__(self, idx):
 
 3. **特征提取：**
    - 双流 Backbone 提取粗/精两级特征
-   - 掩码下采样到 1/8 和 1/2 分辨率
-   - 通过加权或拼接方式融合掩码信息到特征
+   - **不在 Backbone 中拼接掩码**，保持特征的纯净性
+   - 掩码单独传递给 Transformer
 
-4. **掩码化注意力：**
-   - 在 Transformer 的相似度矩阵上应用掩码
-   - 仅允许血管区域之间建立匹配关系
-   - 非血管区域相似度设为 $-\infty$
+4. **解剖偏置注意力：**
+   - 在 Transformer 的注意力分数矩阵上应用**加性偏置 (Additive Bias)**
+   - 通过 $scores = scores + \lambda \cdot vessel\_bias$ 引导注意力向血管区域倾斜
+   - **不截断梯度**，非血管区域保留微弱响应，确保梯度连续性
 
 5. **损失计算：**
    - **粗级：** 仅在血管区域的GT点对上计算损失，血管边缘点权重更高
@@ -362,25 +397,30 @@ def __getitem__(self, idx):
 | 模块 | 原始 RoMa | 引入掩码后的改进 |
 |------|-----------|----------------|
 | **输入** | 仅图像对 | 图像对 + 血管掩码 |
-| **粗特征编码器** | 冻结 DINOv2 | **DINOv2 + Modality Adapter + 血管增强** |
+| **粗特征编码器** | 冻结 DINOv2 | **DINOv2 + Modality Adapter (不拼接掩码)** |
 | **精特征编码器** | VGG19 | VGG19（保持不变） |
 | **匹配解码器** | 锚点概率预测 | **掩码引导的锚点概率预测** |
-| **注意力机制** | 全局无约束匹配 | **解剖偏置 (+λ·W_pair)**，软性引导 |
-| **损失函数** | KL 散度 + Charbonnier | **梯度保底 (min=0.1)**，保证早期收敛 |
-| **训练策略** | 单一阶段 | **课程学习**，从全图对齐到血管精对齐 |
+| **注意力机制** | 全局无约束匹配 | **解剖偏置 (+λ·vessel_bias)**，加性偏置，软性引导 |
+| **损失函数** | KL 散度 + Charbonnier | **梯度保底 (torch.clamp(mask, min=0.1))**，保证早期收敛 |
+| **训练策略** | 单一阶段 | **三阶段课程学习**：阶段1(λ=0, 0-25 epoch)→阶段2(λ=0.2, 25-50)→阶段3(λ=0.05, 50+) |
 | **RANSAC** | 均匀采样 | **空间均匀化 (8×8 Binning)**，防退化 |
 | **旋转支持** | 有限角度 | **±90° 支持**，极大尺度旋转 |
 
 ### 预期效果
 
-通过引入"解剖引导"策略，模型将能够：
+通过引入"解剖引导"策略和三阶段课程学习，模型将能够：
 
 1. **处理极大角度旋转（±90°）和翻转：** RoMa 的 Transformer 解码器在不使用位置编码的情况下非常健壮。由于 DINOv2 提取的是语义级别的特征，即便血管旋转 90°，其局部的拓扑结构特征在 DINO 空间中依然保持高度相似。
 2. **处理大位置偏移：** 即使点对落在背景上，微弱的梯度保底（ε=0.1）也能推动模型学习大尺度的旋转信息。
 3. **避免模型退化：** 空间均匀化 (8×8 Spatial Binning) 强制匹配点散开，防止解算的放射矩阵退化为单位矩阵 $I$。
-4. **提升关键点质量：** 通过解剖偏置引导注意力向血管交叉点和分叉点倾斜，这些区域在跨模态中具有最高的拓扑一致性。
-5. **加速收敛：** 课程学习从易到难，降低了大尺度搜索空间的学习难度。
-6. **解决 LoFTR 无法处理的问题：** 能够处理 30° 以上大旋转问题，甚至支持 ±90° 的极大尺度旋转。
+4. **提升关键点质量：** 通过三阶段课程学习，模型从全图感知逐步过渡到血管区域关注，在训练后期自动聚焦于血管交叉点和分叉点。
+5. **加速收敛与稳定训练：** 
+   - 阶段1（λ=0）：快速学习大尺度几何变换
+   - 阶段2（λ=0.2）：引入弱血管引导，平衡全局和局部
+   - 阶段3（λ=0.05）：精细调优，避免过度依赖掩码
+   - 前50 epoch保护期：确保模型充分学习基础特征后再启用早停
+6. **推理时的鲁棒性：** 测试时设置 λ=0，确保模型不依赖掩码，具有更好的泛化能力。
+7. **解决 LoFTR 无法处理的问题：** 能够处理 30° 以上大旋转问题，甚至支持 ±90° 的极大尺度旋转。
 
 ---
 
@@ -402,3 +442,106 @@ def __getitem__(self, idx):
 * **核心任务：** 稠密 Warp → 空间均匀采样（8×8 分区）→ RANSAC。
 * **预期目标：** 输出最终的放射变换矩阵 $M$。
 
+---
+
+## 训练与验证配置总结
+
+### 训练配置（train_onGen.py / train_onReal.py）
+
+**课程学习策略：**
+```python
+# 阶段1 (0-25 epoch): λ = 0.0 (全图感知期)
+if current_epoch < 25:
+    lambda_vessel = 0.0
+    
+# 阶段2 (25-50 epoch): λ = 0.2 (软掩码引导期)
+elif current_epoch < 50:
+    lambda_vessel = 0.2
+    
+# 阶段3 (50+ epoch): λ = 0.05 (精度冲刺期)
+else:
+    lambda_vessel = 0.05
+```
+
+**早停配置：**
+- `min_epochs = 50`：前50 epoch不触发早停
+- `patience = 8`：验证损失连续8个epoch不改善则停止
+- `monitor = 'val_mse'`：监控验证集MSE
+
+### 验证/测试配置（validation_step / test_onReal.py）
+
+**推理时配置：**
+```python
+# 完全关闭血管掩码偏置
+lambda_vessel = 0.0
+```
+
+**原因：**
+1. 避免对掩码的过度依赖
+2. 测试模型的纯特征匹配能力
+3. 确保在真实场景（可能没有精确掩码）下也能工作
+
+### 空间均匀化采样实现
+
+**在 RANSAC 之前应用：**
+```python
+def spatial_binning(pts0, pts1, mconf, img_size, grid_size=8, top_k=5):
+    """
+    空间均匀化采样：将图像划分为 grid_size x grid_size 个分区
+    每个分区选取置信度最高的 top_k 个点
+    """
+    H, W = img_size
+    cell_h = H / grid_size
+    cell_w = W / grid_size
+    
+    # 计算每个点所属的格子
+    grid_y = (pts0[:, 1] / cell_h).astype(int)
+    grid_x = (pts0[:, 0] / cell_w).astype(int)
+    grid_y = np.clip(grid_y, 0, grid_size - 1)
+    grid_x = np.clip(grid_x, 0, grid_size - 1)
+    
+    pts0_binned = []
+    pts1_binned = []
+    
+    for i in range(grid_size):
+        for j in range(grid_size):
+            mask = (grid_y == i) & (grid_x == j)
+            if mask.sum() == 0:
+                continue
+            
+            # 选取置信度最高的 top_k 个点
+            indices = np.where(mask)[0]
+            conf_in_cell = mconf[indices]
+            
+            if len(indices) > top_k:
+                top_indices = np.argsort(-conf_in_cell)[:top_k]
+                indices = indices[top_indices]
+            
+            pts0_binned.append(pts0[indices])
+            pts1_binned.append(pts1[indices])
+    
+    return np.concatenate(pts0_binned), np.concatenate(pts1_binned)
+
+# 使用示例
+mkpts0_binned, mkpts1_binned = spatial_binning(
+    mkpts0, mkpts1, mconf, 
+    img_size=(518, 518), 
+    grid_size=8, 
+    top_k=5
+)
+
+# 然后使用 RANSAC
+H, mask = cv2.findHomography(mkpts0_binned, mkpts1_binned, cv2.RANSAC, 3.0)
+```
+
+**效果：**
+- 典型情况：1000+ 匹配点 → 100-300 个均匀分布的点
+- 极大提高放射矩阵求解的稳定性和精度
+- 防止匹配点集中在血管密集区域导致的矩阵退化
+
+### 一致性保证
+
+- ✅ `train_onGen.py` 和 `train_onReal.py` 使用相同的课程学习策略
+- ✅ `train_onGen.py`、`train_onReal.py`、`test_onReal.py` 的验证/测试过程统一设置 λ=0
+- ✅ 所有训练脚本的早停配置一致（min_epochs=50, patience=8）
+- ✅ 所有脚本在 RANSAC 前使用相同的空间均匀化采样（8×8网格，每格最多5个点）

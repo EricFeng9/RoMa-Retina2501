@@ -154,22 +154,23 @@ class RoMa(nn.Module):
             data: dict with keys:
                 - 'image0': [B, 1, H, W]
                 - 'image1': [B, 1, H, W]
-                - 'vessel_mask0': [B, 1, H, W] (optional)
-                - 'vessel_mask1': [B, 1, H, W] (optional)
+                - 'mask0': [B, 1, H, W] (optional) 血管掩码
+                - 'mask1': [B, 1, H, W] (optional) 血管掩码
         Returns:
             data: updated dict with matching results
-        """
-        # 1. 提取特征
-        feat_c0, feat_f0 = self.backbone(data['image0'], 
-                                         data.get('vessel_mask0', None))
-        feat_c1, feat_f1 = self.backbone(data['image1'], 
-                                         data.get('vessel_mask1', None))
         
-        # 2. Transformer 匹配 (粗级)
+        注意：按照图片要求，不在 Backbone 中拼接 image0 和 mask0。
+        Backbone 只提取纯净的图像特征，掩码在 Transformer 的注意力机制中使用。
+        """
+        # 1. 提取特征（不传入掩码，保持特征纯净性）
+        feat_c0, feat_f0 = self.backbone(data['image0'], None)
+        feat_c1, feat_f1 = self.backbone(data['image1'], None)
+        
+        # 2. Transformer 匹配 (粗级) - 传入掩码用于解剖偏置注意力
         anchor_probs, feat0_trans, feat1_trans = self.transformer(
             feat_c0, feat_c1,
-            data.get('vessel_mask0', None),
-            data.get('vessel_mask1', None)
+            data.get('mask0', None),
+            data.get('mask1', None)
         )
         
         # 3. 提取粗匹配点

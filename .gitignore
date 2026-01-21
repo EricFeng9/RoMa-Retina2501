@@ -11,3 +11,5 @@ jobs/*
 wandb*
 results/*
 data/*
+test_results/*
+logs/*
