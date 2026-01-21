@@ -266,8 +266,8 @@ class RoMaValidationCallback(Callback):
         with open(latest_path / "log.txt", "w") as f:
             f.write(f"Epoch: {epoch_num}\nLatest MSE: {avg_mse:.6f}")
             
-        # 更新最优权重
-        if avg_mse < self.best_val_mse:
+        # 更新最优权重（忽略 initial 验证，从 epoch 5 开始计入）
+        if epoch_num >= 5 and avg_mse < self.best_val_mse:
             self.best_val_mse = avg_mse
             best_path = self.result_dir / "best_checkpoint"
             best_path.mkdir(exist_ok=True)
@@ -275,6 +275,8 @@ class RoMaValidationCallback(Callback):
             with open(best_path / "log.txt", "w") as f:
                 f.write(f"Epoch: {epoch_num}\nBest MSE: {avg_mse:.6f}")
             loguru_logger.info(f"发现新的最优模型! {epoch_name}, MSE: {avg_mse:.6f}")
+        elif epoch_num == 0:
+            loguru_logger.info(f"Initial 验证不计入 best score")
 
     def _save_batch_results(self, trainer, pl_module, batch, outputs, epoch_dir):
         batch_size = batch['image0'].shape[0]
@@ -347,7 +349,7 @@ class RoMaValidationCallback(Callback):
             # 计算 MSE
             try:
                 res_f, orig_f = filter_valid_area(img1_result, img1_origin)
-                mask = (res_f > 0)
+                mask = (res_f > 10) & (orig_f > 10)
                 if np.any(mask):
                     mse = np.mean(((res_f[mask] / 255.0) - (orig_f[mask] / 255.0)) ** 2)
                 else:
