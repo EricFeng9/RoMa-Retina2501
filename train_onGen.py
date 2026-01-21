@@ -183,6 +183,17 @@ class LitProgressBar(TQDMProgressBar):
         super().on_train_epoch_start(trainer, pl_module)
         self.train_progress_bar.set_description(f"Epoch {trainer.current_epoch + 1}")
 
+class DelayedEarlyStopping(EarlyStopping):
+    """延迟早停：只在指定epoch后才开始计数"""
+    def __init__(self, start_epoch=50, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_epoch = start_epoch
+        
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.current_epoch < self.start_epoch:
+            return  # 不执行早停检查
+        super().on_validation_end(trainer, pl_module)
+
 class RoMaValidationCallback(Callback):
     """RoMa 验证回调：保存图像、计算MSE、管理权重"""
     def __init__(self, args):
@@ -439,8 +450,9 @@ def main():
     tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=args.name)
     val_callback = RoMaValidationCallback(args)
     lr_monitor = LearningRateMonitor(logging_interval='step')
-    # 早停机制：只在50 epoch后开启，patience=8
-    early_stop_callback = EarlyStopping(
+    # 早停机制：从epoch 50开始计数，patience=8（即8次验证 = 40个epoch）
+    early_stop_callback = DelayedEarlyStopping(
+        start_epoch=50,
         monitor='val_mse', 
         patience=8,
         verbose=True,
@@ -450,7 +462,6 @@ def main():
 
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        min_epochs=50,  # 前50 epoch不触发早停
         check_val_every_n_epoch=5,
         num_sanity_val_steps=3,
         callbacks=[val_callback, lr_monitor, early_stop_callback, LitProgressBar()],

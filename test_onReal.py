@@ -46,6 +46,18 @@ class RoMaTestDatasetWrapper(data.Dataset):
         moving_original_t = (moving_original_t + 1.0) / 2.0
         moving_gt_t = (moving_gt_t + 1.0) / 2.0
         
+        # 【关键修复】将 RGB 转换为灰度图（模型期望单通道输入）
+        if fix_t.shape[0] == 3:
+            # 使用标准的 RGB -> Gray 转换: 0.299*R + 0.587*G + 0.114*B
+            fix_t = 0.299 * fix_t[0] + 0.587 * fix_t[1] + 0.114 * fix_t[2]
+            fix_t = fix_t.unsqueeze(0)  # [1, H, W]
+        if moving_original_t.shape[0] == 3:
+            moving_original_t = 0.299 * moving_original_t[0] + 0.587 * moving_original_t[1] + 0.114 * moving_original_t[2]
+            moving_original_t = moving_original_t.unsqueeze(0)
+        if moving_gt_t.shape[0] == 3:
+            moving_gt_t = 0.299 * moving_gt_t[0] + 0.587 * moving_gt_t[1] + 0.114 * moving_gt_t[2]
+            moving_gt_t = moving_gt_t.unsqueeze(0)
+        
         # Resize 到目标尺寸
         import torch.nn.functional as F
         if fix_t.shape[-1] != self.img_size:
@@ -57,9 +69,9 @@ class RoMaTestDatasetWrapper(data.Dataset):
                                    mode='bilinear', align_corners=False).squeeze(0)
 
         return {
-            'image0': fix_t,  # [C, H, W]
-            'image1': moving_original_t,  # [C, H, W] 原始未配准的moving
-            'image1_gt': moving_gt_t,  # [C, H, W] 配准后的GT
+            'image0': fix_t,  # [1, H, W] 灰度图
+            'image1': moving_original_t,  # [1, H, W] 原始未配准的moving（灰度图）
+            'image1_gt': moving_gt_t,  # [1, H, W] 配准后的GT（灰度图）
             'pair_names': (os.path.basename(fix_path), os.path.basename(moving_path)),
             'dataset_name': 'MultiModal'
         }
