@@ -405,12 +405,6 @@ def main():
     if args.main_cfg_path:
         config.merge_from_file(args.main_cfg_path)
     
-    # 确保 PLOT_MATCHES_ALPHA 属性存在(兼容性修复)
-    if not hasattr(config.TRAINER, 'PLOT_MATCHES_ALPHA'):
-        config.defrost()
-        config.TRAINER.PLOT_MATCHES_ALPHA = 'dynamic'
-        config.freeze()
-    
     # 日志文件
     result_dir = Path(f"results/{args.mode}/{args.name}")
     result_dir.mkdir(parents=True, exist_ok=True)
