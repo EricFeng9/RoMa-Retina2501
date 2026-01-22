@@ -34,11 +34,11 @@ import logging
 from src.config.default import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
-from data.FIVES_extract.FIVES_extract import MultiModalDataset
+from data.FIVES_extract_v2.FIVES_extract_v2 import MultiModalDataset
 from src.utils.plotting import make_matching_figures
 
 # 数据集根目录：指向本地 data 目录
-DATA_ROOT = "/data/student/Fengjunming/LoFTR/data/FIVES_extract"  # 保持原路径或按需修改
+DATA_ROOT = "/data/student/Fengjunming/LoFTR/data/FIVES_extract_v2"  # 保持原路径或按需修改
 
 # 配置日志格式
 loguru_logger = get_rank_zero_only_logger(logger)
