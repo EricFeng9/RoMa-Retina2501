@@ -31,7 +31,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ca
 from pytorch_lightning.strategies import DDPStrategy
 import logging
 
-from configs.roma_multimodal import get_cfg_defaults
+from src.config.default import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
 from data.FIVES_extract_v2.FIVES_extract_v2 import MultiModalDataset
@@ -404,6 +404,12 @@ def main():
     config = get_cfg_defaults()
     if args.main_cfg_path:
         config.merge_from_file(args.main_cfg_path)
+    
+    # 确保 PLOT_MATCHES_ALPHA 属性存在(兼容性修复)
+    if not hasattr(config.TRAINER, 'PLOT_MATCHES_ALPHA'):
+        config.defrost()
+        config.TRAINER.PLOT_MATCHES_ALPHA = 'dynamic'
+        config.freeze()
     
     # 日志文件
     result_dir = Path(f"results/{args.mode}/{args.name}")
