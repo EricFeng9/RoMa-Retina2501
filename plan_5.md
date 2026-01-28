@@ -50,9 +50,10 @@ class SuperPointEncoder(nn.Module):
         *   SuperPoint 输出通常为 $1/8$ 分辨率。
         *   VGG 的粗特征 `feat_coarse_vgg` 如果是 $1/4$，则需要下采样到 $1/8$。
         *   **决策**: 统一对齐到 $1/8$ 分辨率。这有利于降低 Transformer 计算量（序列长度减少 4 倍），且 $1/8$ 对粗匹配已足够。
-    *   **特征融合**:
-        *   使用 `torch.cat([feat_vgg_aligned, feat_spp], dim=1)`。
-        *   融合后的特征将包含 **纹理信息 (VGG)** + **几何结构信息 (SuperPoint)**。
+    *   **特征融合 (已移除)**:
+        *   ~~使用 `torch.cat([feat_vgg_aligned, feat_spp], dim=1)`。~~
+        *   **修正**: 为了保证粗特征的纯净性和完全冻结状态，**不融合 VGG 特征**。直接使用 `feat_spp` 作为粗特征输入 Transformer。
+        *   这样可以避免 VGG 在微调过程中导致的特征漂移（Feature Drift）和边缘效应。
 
 ## 3. 配置与权重管理
 
@@ -75,9 +76,9 @@ class SuperPointEncoder(nn.Module):
 | **VGG Coarse** | 256 | 1/4 (部分实现取1/8) | 下采样至 1/8 |
 | **DINOv2** | 384 | 1/14 (Patch) -> 插值 | **移除** |
 | **SuperPoint** | 256 | 1/8 | 保持 |
-| **Transformer** | Input Proj | - | 修改 Input Proj 接受 (256+256)=512 dim |
+| **Transformer** | Input Proj | - | 修改 Input Proj 接受 256 dim (仅 SuperPoint) |
 
-**注意**：RoMa 的 Transformer 输入层通常有一个 `input_proj` 层。如果 Backbone 输出维度改变（从 `256(VGG)+384(DINO)=640` 变为 `256(VGG)+256(SPP)=512`），需要确保 `LoFTR` 或 `RoMa` 模型的初始化代码能自动读取 Backbone 的输出通道数，或者我们需要手动修改 Transformer 的输入维度配置。
+**注意**：RoMa 的 Transformer 输入层通常有一个 `input_proj` 层。由于我们移除了 VGG 融合，Backbone 输出维度变为 **256 (SuperPoint only)**。我们需要确保 `RoMaTransformer` 的初始化代码能正确计算 `in_channels`，不再加上 `d_vgg`。
 
 ## 5. 执行步骤
 
