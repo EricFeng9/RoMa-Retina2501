@@ -12,6 +12,7 @@ _CN.ROMA = CN()
 _CN.ROMA.USE_DINOV2 = True  # 是否使用 DINOv2 (推荐启用以支持大角度旋转)
 _CN.ROMA.DINOV2_MODEL = 'dinov2_vitl14'  # DINOv2 模型类型
 _CN.ROMA.DINOV2_PATH = None  # 本地权重路径 (可选，如: '/path/to/dinov2_vits14.pth')
+_CN.ROMA.SUPERPOINT_PATH = 'weights/superpoint_v1.pth' # SuperPoint 权重路径
 _CN.ROMA.D_MODEL = 256  # Transformer 维度
 _CN.ROMA.N_HEADS = 8  # 注意力头数
 _CN.ROMA.N_LAYERS = 4  # Transformer 层数
