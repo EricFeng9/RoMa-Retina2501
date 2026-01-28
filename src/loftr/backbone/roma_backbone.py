@@ -86,14 +86,14 @@ class CoarseEncoder(nn.Module):
             if isinstance(feat_out, dict):
                 feat = feat_out['x_norm_patchtokens'] # [B, N, D]
             else:
-                # 某些版本可能直接返回 tokens，需剥离 CLS
+                # 剥离 CLS
                 feat = feat_out[:, 1:] 
                 
             B, N, D = feat.shape
             H_patch = W_patch = int(N**0.5)
             feat = feat.permute(0, 2, 1).reshape(B, D, H_patch, W_patch)
         
-        return feat
+        return feat, x_adapted
 
 
 class FineEncoder(nn.Module):
@@ -172,8 +172,9 @@ class RoMaBackbone(nn.Module):
         feat_coarse_vgg, feat_fine = self.fine_encoder(x, None)
         
         # 粗特征 (DINOv2 或 VGG) - 不传入 vessel_mask
+        x_adapted = None
         if self.coarse_encoder is not None:
-            feat_coarse_dino = self.coarse_encoder(x, None)
+            feat_coarse_dino, x_adapted = self.coarse_encoder(x, None)
             # 统一分辨率：将 VGG 粗特征对齐到 DINOv2 的 Patch 分辨率 (如 37x37)
             # 这样做可以减小 Transformer 的序列长度，防止 vessel_bias 矩阵过大导致 OOM
             if feat_coarse_vgg.shape[2:] != feat_coarse_dino.shape[2:]:
@@ -183,4 +184,4 @@ class RoMaBackbone(nn.Module):
         else:
             feat_c = feat_coarse_vgg
         
-        return feat_c, feat_fine
+        return feat_c, feat_fine, x_adapted

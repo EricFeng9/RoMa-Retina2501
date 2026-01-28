@@ -213,6 +213,12 @@ class PL_RoMa_Baseline_Real(PL_RoMa):
             'loss_f': metrics['loss_f'],
             'H_est': H_ests,
             'figures': figures,
+            'feat_c0': data.get('feat_c0'),
+            'feat_c1': data.get('feat_c1'),
+            'feat_f0': data.get('feat_f0'),
+            'feat_f1': data.get('feat_f1'),
+            'x_adapted0': data.get('x_adapted0'),
+            'x_adapted1': data.get('x_adapted1'),
             **auc_metrics
         }
         self.validation_step_outputs.append(output)
@@ -376,6 +382,27 @@ class MultimodalValidationCallback(Callback):
                     fig = outputs['figures']['evaluation'][i]
                     fig.savefig(str(save_path / "matches.png"), bbox_inches='tight')
                     plt.close(fig)
+            except: pass
+
+            # [新增] 特征图可视化
+            from src.utils.plotting import visualize_feature_maps
+            try:
+                if 'feat_c0' in outputs and outputs['feat_c0'] is not None:
+                    visualize_feature_maps(outputs['feat_c0'][i:i+1], save_path / "feat_coarse_fix.png", title="Coarse Fix")
+                if 'feat_c1' in outputs and outputs['feat_c1'] is not None:
+                    visualize_feature_maps(outputs['feat_c1'][i:i+1], save_path / "feat_coarse_mov.png", title="Coarse Mov")
+                if 'feat_f0' in outputs and outputs['feat_f0'] is not None:
+                    visualize_feature_maps(outputs['feat_f0'][i:i+1], save_path / "feat_fine_fix.png", title="Fine Fix")
+                if 'feat_f1' in outputs and outputs['feat_f1'] is not None:
+                    visualize_feature_maps(outputs['feat_f1'][i:i+1], save_path / "feat_fine_mov.png", title="Fine Mov")
+                
+                # [新增] 适配图可视化 (DINOv2 Input)
+                if 'x_adapted0' in outputs and outputs['x_adapted0'] is not None:
+                    img_ada = (outputs['x_adapted0'][i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    cv2.imwrite(str(save_path / "adapted_fix.png"), cv2.cvtColor(img_ada, cv2.COLOR_RGB2BGR))
+                if 'x_adapted1' in outputs and outputs['x_adapted1'] is not None:
+                    img_ada = (outputs['x_adapted1'][i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+                    cv2.imwrite(str(save_path / "adapted_mov.png"), cv2.cvtColor(img_ada, cv2.COLOR_RGB2BGR))
             except: pass
             
         return mses, maces

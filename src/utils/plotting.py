@@ -156,3 +156,28 @@ def error_colormap(err, thr, alpha=1.0):
     x = 1 - np.clip(err / (thr * 2), 0, 1)
     return np.clip(
         np.stack([2-x*2, x*2, np.zeros_like(x), np.ones_like(x)*alpha], -1), 0, 1)
+
+def visualize_feature_maps(feat, save_path, title=None):
+    """
+    可视化特征图：取通道均值并应用伪彩色
+    Args:
+        feat: [1, C, H, W] tensor
+        save_path: 保存路径
+    """
+    import cv2
+    import torch
+    if feat is None: return
+    
+    # 取通道均值
+    am = torch.mean(feat[0], dim=0).cpu().numpy()
+    # 归一化到 [0, 1]
+    am = (am - am.min()) / (am.max() - am.min() + 1e-8)
+    # 转换为 8bit
+    am = (am * 255).astype(np.uint8)
+    # 应用彩色映射
+    am_color = cv2.applyColorMap(am, cv2.COLORMAP_JET)
+    
+    if title:
+        cv2.putText(am_color, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+    cv2.imwrite(str(save_path), am_color)

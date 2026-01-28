@@ -163,8 +163,8 @@ class RoMa(nn.Module):
         Backbone 只提取纯净的图像特征，掩码在 Transformer 的注意力机制中使用。
         """
         # 1. 提取特征（不传入掩码，保持特征纯净性）
-        feat_c0, feat_f0 = self.backbone(data['image0'], None)
-        feat_c1, feat_f1 = self.backbone(data['image1'], None)
+        feat_c0, feat_f0, x_adapted0 = self.backbone(data['image0'], None)
+        feat_c1, feat_f1, x_adapted1 = self.backbone(data['image1'], None)
         
         # 2. Transformer 匹配 (粗级) - 传入掩码用于解剖偏置注意力
         anchor_probs, feat0_trans, feat1_trans = self.transformer(
@@ -197,7 +197,14 @@ class RoMa(nn.Module):
             'mkpts1_f': mkpts1_f,
             'mconf': mconf,
             'm_bids': b_ids,
-            'anchor_probs': anchor_probs  # 用于损失计算
+            'anchor_probs': anchor_probs,  # 用于损失计算
+            # [新增] 用于可视化的中间变量
+            'feat_c0': feat_c0,
+            'feat_c1': feat_c1,
+            'feat_f0': feat_f0,
+            'feat_f1': feat_f1,
+            'x_adapted0': x_adapted0,
+            'x_adapted1': x_adapted1,
         })
         
         return data
