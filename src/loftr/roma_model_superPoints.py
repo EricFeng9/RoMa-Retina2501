@@ -26,7 +26,7 @@ class FineMatching(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 2, kernel_size=1)  # 输出 (dx, dy) 偏移
+            nn.Conv2d(64, 2, kernel_size=1)
         )
         
     def crop_patches(self, feat, mkpts, b_ids, window_size):
