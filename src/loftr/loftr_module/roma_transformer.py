@@ -162,8 +162,27 @@ class RoMaTransformer(nn.Module):
         self.num_anchors = num_anchors
         
         # 特征投影层 (将 Backbone 特征投影到 d_model 维度)
-        # DINOv2 (384) + VGG (256) = 640
-        self.feat_proj = nn.Conv2d(640, d_model, kernel_size=1)
+        # 动态计算输入通道数
+        use_dinov2 = config.get('ROMA', {}).get('USE_DINOV2', False)
+        dinov2_model = config.get('ROMA', {}).get('DINOV2_MODEL', 'dinov2_vits14')
+        
+        d_vgg = 256
+        d_dinov2 = 0
+        
+        if use_dinov2:
+            if 'vits' in dinov2_model:
+                d_dinov2 = 384
+            elif 'vitb' in dinov2_model:
+                d_dinov2 = 768
+            elif 'vitl' in dinov2_model:
+                d_dinov2 = 1024
+            elif 'vitg' in dinov2_model:
+                d_dinov2 = 1536
+            else:
+                d_dinov2 = 384 # Default fallback
+                
+        in_channels = d_vgg + d_dinov2
+        self.feat_proj = nn.Conv2d(in_channels, d_model, kernel_size=1)
         
         # Transformer 层
         self.layers = nn.ModuleList([
