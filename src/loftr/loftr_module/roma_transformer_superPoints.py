@@ -187,7 +187,12 @@ class RoMaTransformer(nn.Module):
         # 如果既没有dinov2也没有superpoint，in_channels就只是vgg的维度
         # 但目前Backbone的逻辑是VGG特征总是存在的，而coarse encoder是可选的
         # 并且在superpoint_backbone中，feat_c是拼接后的结果
-        in_channels = d_vgg + d_coarse
+        # 如果是 SuperPoint 模式，Backbone 只输出 SuperPoint 特征 (256维)
+        if superpoint_path is not None and not use_dinov2:
+            in_channels = d_coarse
+        else:
+            # DINOv2 模式或者其他模式，通常会融合 VGG 特征 (RoMa 原版逻辑)
+            in_channels = d_vgg + d_coarse
 
         # 兜底：如果没开启任何 Coarse Encodere, in_channels = d_vgg
         

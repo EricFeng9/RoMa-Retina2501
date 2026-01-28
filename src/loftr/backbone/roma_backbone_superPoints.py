@@ -97,7 +97,8 @@ class RoMaBackbone(nn.Module):
             feat_coarse_vgg = F.interpolate(feat_coarse_vgg, size=(target_h, target_w), 
                                             mode='bilinear', align_corners=False)
             
-        # 4. Fusion
-        feat_c = torch.cat([feat_coarse_vgg, feat_coarse_spp], dim=1) # [B, 512, H/8, W/8]
+        # 4. No Fusion (Pure SuperPoint)
+        # feat_c = torch.cat([feat_coarse_vgg, feat_coarse_spp], dim=1) # [B, 512, H/8, W/8]
+        feat_c = feat_coarse_spp # [B, 256, H/8, W/8]
         
         return feat_c, feat_fine, None # x_adapted is None for SuperPoint
