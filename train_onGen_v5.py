@@ -509,6 +509,11 @@ def main():
     result_dir.mkdir(parents=True, exist_ok=True)
     loguru_logger.add(result_dir / "log.txt", enqueue=True, mode="a")
     model = PL_RoMa_Baseline(config, pretrained_ckpt=args.pretrained_ckpt, use_domain_rand=True, result_dir=str(result_dir))
+    
+    # 冻结 Backbone (VGG + SuperPoint)
+    for param in model.model.backbone.parameters():
+        param.requires_grad = False
+    loguru_logger.info("已冻结 Backbone (VGG + SuperPoint) 权重")
     data_module = MultimodalDataModule(args, config)
     tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=args.name)
     val_callback = MultimodalValidationCallback(args, str(result_dir))

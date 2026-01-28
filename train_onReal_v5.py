@@ -439,7 +439,7 @@ def parse_args():
     parser.add_argument('--img_size', type=int, default=518)
     parser.add_argument('--max_epochs', type=int, default=100)
     parser.add_argument('--gpus', type=str, default='1')
-
+    parser.add_argument('--gpus', type=str, default='1')
     return parser.parse_args()
 
 def main():
@@ -462,6 +462,11 @@ def main():
     loguru_logger.add(result_dir / "log.txt", enqueue=True, mode="a")
     
     model = PL_RoMa_Baseline_Real(config, pretrained_ckpt=None)
+    
+    # 冻结 Backbone (VGG + SuperPoint)
+    for param in model.model.backbone.parameters():
+        param.requires_grad = False
+    loguru_logger.info("已冻结 Backbone (VGG + SuperPoint) 权重")
     
     # 根据模式选择真实数据集
     if args.mode == 'cffa':
