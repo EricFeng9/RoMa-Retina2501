@@ -37,7 +37,7 @@ class CoarseEncoder(nn.Module):
     """粗特征编码器: Modality Adapter + 冻结的 DINOv2"""
     def __init__(self, dinov2_model='dinov2_vits14', freeze_dinov2=True, dinov2_path=None):
         super().__init__()
-        self.adapter = ModalityAdapter(in_channels=1, out_channels=3)
+        # self.adapter = ModalityAdapter(in_channels=1, out_channels=3) # Removed
         
         # 加载 DINOv2 (支持本地路径和在线下载两种方式)
         try:
@@ -76,8 +76,11 @@ class CoarseEncoder(nn.Module):
         注意：按照图片要求，不在 Backbone 中拼接掩码，保持特征纯净性。
         掩码将在 Transformer 的注意力机制中通过加性偏置引入。
         """
-        # 模态适配
-        x_adapted = self.adapter(x)
+        # 模态适配: 直接复制灰度通道 (B, 1, H, W) -> (B, 3, H, W)
+        if x.shape[1] == 1:
+            x_adapted = x.repeat(1, 3, 1, 1)
+        else:
+            x_adapted = x
         
         # DINOv2 特征提取
         with torch.no_grad() if not self.training else torch.enable_grad():
