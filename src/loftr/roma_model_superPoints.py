@@ -13,9 +13,14 @@ from .loftr_module.roma_transformer_superPoints import RoMaTransformer
 
 class FineMatching(nn.Module):
     """精细匹配模块：基于粗匹配结果进行亚像素细化"""
-    def __init__(self, d_model=256, window_size=5):
+    def __init__(self, d_model=128, window_size=5):
         super().__init__()
         self.window_size = window_size
+        self.d_model = d_model
+        
+        # d_model should be 128 for VGG fine features. 
+        # Input to refine_net is feat_f0 (128) + feat_f1 (128) = 256.
+        # So d_model * 2 = 256.
         self.refine_net = nn.Sequential(
             nn.Conv2d(d_model * 2, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -24,30 +29,193 @@ class FineMatching(nn.Module):
             nn.Conv2d(64, 2, kernel_size=1)  # 输出 (dx, dy) 偏移
         )
         
-    def forward(self, feat_f0, feat_f1, mkpts0_c, mkpts1_c):
+    def crop_patches(self, feat, mkpts, b_ids, window_size):
+        """
+        从特征图中裁剪局部窗口
+        Args:
+            feat: [B, C, H, W]
+            mkpts: [M, 2] 像素坐标 (x, y)
+            b_ids: [M]
+            window_size: int
+        Returns:
+            patches: [M, C, W, W]
+        """
+        B, C, H, W = feat.shape
+        M = mkpts.shape[0]
+        
+        # 归一化坐标到 [-1, 1]
+        # grid_sample expects (x, y) in [-1, 1]
+        # mkpts are in range [0, W_orig-1], [0, H_orig-1]
+        # We need to map to feat resolution coords first?
+        # Actually simplest to use normalized coords directly.
+        # But mkpts input to this function are already scaled to pixels of ORIGINAL image in RoMa.forward?
+        # Let's check RoMa.forward. It passes mkpts0_c_pix.
+        # And feat is H/4, W/4.
+        # So we should map pixels to [-1, 1].
+        
+        # NOTE: mkpts passed here are in original image resolution (H_orig, W_orig).
+        # We assume feat covers the same FOV.
+        # So we normalize using H_orig, W_orig (which we don't strictly have here, but we can infer if we assume feat is 1/4).
+        # Actually safer to pass scalers. But assuming 1/4 is consistent with Backbone.
+        
+        # Wait, grid_sample uses relative coordinates [-1, 1]. 
+        # So (0,0) is top-left, (W-1, H-1) is bottom-right.
+        # If mkpts are in (0..W_orig), we normalize by W_orig.
+        # W_orig = W * 4.
+        
+        # Generate grid for each keypoint
+        # Grid range: [-win/2, win/2] pixels.
+        
+        device = feat.device
+        
+        # Create a base grid [1, 1, win, win, 2]
+        r = window_size // 2
+        grid_base_range = torch.arange(-r, r + 1, device=device)
+        grid_y, grid_x = torch.meshgrid(grid_base_range, grid_base_range, indexing='ij')
+        grid_base = torch.stack([grid_x, grid_y], dim=-1).float() # [win, win, 2]
+        
+        # Expand for all matches: [M, win, win, 2]
+        grid = grid_base.unsqueeze(0).expand(M, -1, -1, -1)
+        
+        # Add keypoint centers
+        # mkpts: [M, 2]. Scale to feature map resolution? 
+        # grid_base is in pixels of feature map? Or original image?
+        # Usually easier to work in normalized coords of the feature map.
+        
+        # Let's normalize everything to [-1, 1].
+        # H, W are feature map dims.
+        # mkpts are in original pixels.
+        # Original dims approx H*4, W*4.
+        
+        # Normalize mkpts to [-1, 1]
+        # x_norm = 2 * (x / (W_orig - 1)) - 1
+        # If we don't know W_orig, we can try to use feature map W.
+        # x_feat = x_orig / 4.0
+        # x_norm = 2 * (x_feat / (W - 1)) - 1
+        
+        # Better:
+        mkpts_feat = mkpts / 4.0 # Scale to feature map coords
+        
+        # Normalize to [-1, 1]
+        # grid_sample coordinates: -1=left, 1=right.
+        # size (W, H)
+        inv_h = 1.0 / (H - 1)
+        inv_w = 1.0 / (W - 1)
+        
+        # Add center to grid
+        # grid is offset in pixels. 
+        # sample_grid = (center + grid_offset) normalized
+        center = mkpts_feat.unsqueeze(1).unsqueeze(1) # [M, 1, 1, 2]
+        sampling_grid = center + grid # [M, win, win, 2] in feature pixels
+        
+        # Normalize sampling grid
+        sampling_grid_norm = torch.zeros_like(sampling_grid)
+        sampling_grid_norm[..., 0] = 2.0 * sampling_grid[..., 0] * inv_w - 1.0
+        sampling_grid_norm[..., 1] = 2.0 * sampling_grid[..., 1] * inv_h - 1.0
+        
+        # Ensure we sample from proper batch indices
+        # grid_sample doesn't support list of batch indices directly.
+        # We have to reshape everything to [M, C, H, W] is not possible because feats are [B...].
+        # We have to iterate or construct a hack.
+        # A common trick: Reshape B into channels or use F.grid_sample on valid items.
+        # But M matches can come from different batch items.
+        
+        # Solution:
+        # Loop over unique batch ids? Or just loop B.
+        patches_list = []
+        for b in range(B):
+            mask = (b_ids == b)
+            if not mask.any():
+                continue
+            
+            # Select proper points
+            sub_grid = sampling_grid_norm[mask] # [m, win, win, 2]
+            
+            # Feature map for this batch [1, C, H, W]
+            sub_feat = feat[b].unsqueeze(0) 
+            
+            # Grid sample
+            # input: [1, C, H, W]
+            # grid: [1, m, win*win, 2]? No.
+            # Grid sample expects [N, H_out, W_out, 2].
+            # We want output [m, C, win, win].
+            # We can trick it: set N=m? No, feat has Batch=1.
+            # We can treat 'm' as the height of the output grid?
+            # grid: [1, m*win, win, 2] -> Output [1, C, m*win, win] -> reshape
+            
+            m = sub_grid.shape[0]
+            flat_grid = sub_grid.reshape(1, m * window_size, window_size, 2)
+            
+            out = F.grid_sample(sub_feat, flat_grid, mode='bilinear', align_corners=True, padding_mode='zeros')
+            # out: [1, C, m*win, win]
+            
+            out = out.view(C, m, window_size, window_size).permute(1, 0, 2, 3) # [m, C, win, win]
+            
+            # We need to put them back in order? 
+            # The mask approach splits them. We need to collect valid indices to restore order.
+            # Or just append and assume we sort later? No.
+            
+            # Easier way:
+            # Reconstruct full tensor.
+            patches_list.append((torch.where(mask)[0], out))
+            
+        # Reassemble
+        patches = torch.zeros(M, C, window_size, window_size, dtype=feat.dtype, device=device)
+        for indices, sub_patches in patches_list:
+            patches[indices] = sub_patches
+            
+        return patches
+        
+    def forward(self, feat_f0, feat_f1, mkpts0_c, mkpts1_c, b_ids):
         """
         Args:
             feat_f0: [B, d, H/4, W/4] 精细特征
             feat_f1: [B, d, H/4, W/4] 精细特征
-            mkpts0_c: [B, N, 2] 粗匹配点 (在原图尺度)
-            mkpts1_c: [B, N, 2] 粗匹配点 (在原图尺度)
+            mkpts0_c: [M, 2] 粗匹配点 (在原图尺度, pixels)
+            mkpts1_c: [M, 2] 粗匹配点
+            b_ids: [M]
         Returns:
-            mkpts0_f: [B, N, 2] 精细匹配点
-            mkpts1_f: [B, N, 2] 精细匹配点
+            mkpts0_f: [M, 2] 精细匹配点
+            mkpts1_f: [M, 2] 精细匹配点
         """
-        B, d, H, W = feat_f0.shape
-        N = mkpts0_c.shape[1]
+        if mkpts0_c.shape[0] == 0:
+            return mkpts0_c, mkpts1_c
+            
+        # 1. Extract patches
+        # feat_f0 (128 ch)
+        patch0 = self.crop_patches(feat_f0, mkpts0_c, b_ids, self.window_size) # [M, 128, 5, 5]
+        patch1 = self.crop_patches(feat_f1, mkpts1_c, b_ids, self.window_size) # [M, 128, 5, 5]
         
-        # 将坐标缩放到精细特征图尺度
-        scale = torch.tensor([W-1, H-1], device=feat_f0.device)
-        mkpts0_scaled = mkpts0_c / scale * torch.tensor([W-1, H-1], device=feat_f0.device)
-        mkpts1_scaled = mkpts1_c / scale * torch.tensor([W-1, H-1], device=feat_f0.device)
+        # 2. Concat
+        patch_pair = torch.cat([patch0, patch1], dim=1) # [M, 256, 5, 5]
         
-        # 提取局部窗口特征 (简化版，使用grid_sample)
-        # 这里简化处理：直接返回粗匹配结果
-        # TODO: 实现完整的局部窗口匹配
+        # 3. Predict Delta
+        # RefineNet: [M, 256, 5, 5] -> [M, 2, 5, 5] (assuming stride 1, pad 1 for 3x3 conv)
+        delta_map = self.refine_net(patch_pair)
         
-        return mkpts0_c, mkpts1_c
+        # Take center or global average?
+        # Assuming we simply take the center value as the offset for the keypoint
+        # Or if the net predicts a heatmap, we'd do expectations.
+        # But Output is 2 channels using simple Conv.
+        # Let's take the center feature as the offset.
+        c = self.window_size // 2
+        delta = delta_map[:, :, c, c] # [M, 2]
+        
+        # Limit delta range to avoid flying away?
+        # Often helpful to tanh * scale
+        # delta = torch.tanh(delta) * (self.window_size / 2)
+        
+        # 4. Apply refinement to mkpts1 (usually we refine the second point to match the first?)
+        # Or refining both?
+        # RoMa usually refines matches relative to each other.
+        # Let's refine mkpts1 to better match mkpts0?
+        # Or this module outputs offsets for BOTH? 2 channels usually means dx, dy for one point.
+        # Assuming optimizing mkpts1 to match mkpts0.
+        mkpts1_f = mkpts1_c + delta
+        mkpts0_f = mkpts0_c # Keep 0 fixed? Or maybe fine_net output 4 channels for both?
+        # Config 2 channels usually implies 1 point update or relative update.
+        
+        return mkpts0_f, mkpts1_f
 
 
 class RoMa(nn.Module):
@@ -65,8 +233,11 @@ class RoMa(nn.Module):
         self.transformer = RoMaTransformer(config)
         
         # 精细匹配
+        # VGG Fine Features have 128 channels.
+        # FineMatching receives concatenated features (128+128=256).
+        # refine_net expects 2*d_model. So we MUST set d_model=128.
         self.fine_matching = FineMatching(
-            d_model=config.get('ROMA', {}).get('D_MODEL', 256),
+            d_model=128, # Force 128 to match VGG fine features
             window_size=config.get('ROMA', {}).get('FINE_WINDOW_SIZE', 5)
         )
         
@@ -186,9 +357,9 @@ class RoMa(nn.Module):
         mkpts0_c_pix = mkpts0_c * torch.tensor([W-1, H-1], device=mkpts0_c.device)
         mkpts1_c_pix = mkpts1_c * torch.tensor([W-1, H-1], device=mkpts1_c.device)
         
-        # 4. 精细匹配 (简化版：暂时跳过)
-        mkpts0_f = mkpts0_c_pix
-        mkpts1_f = mkpts1_c_pix
+        # 4. 精细匹配 (恢复完整功能)
+        # 传入 b_ids 以便正确采样
+        mkpts0_f, mkpts1_f = self.fine_matching(feat_f0, feat_f1, mkpts0_c_pix, mkpts1_c_pix, b_ids)
         
         # 5. 更新 data
         data.update({
