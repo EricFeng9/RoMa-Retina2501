@@ -9,6 +9,57 @@ import torch.nn.functional as F
 import math
 
 
+class PositionEncodingSine(nn.Module):
+    """
+    标准的正弦位置编码 (Sinusoidal Positional Encoding)
+    这对 Transformer 感知空间结构至关重要，否则它就是 "Permutation Invariant" 的，
+    导致所有匹配点都因为边界效应塌缩到图像边缘。
+    """
+    def __init__(self, d_model, max_shape=(256, 256), temp=10000):
+        super().__init__()
+        self.d_model = d_model
+        self.temp = temp
+        self.scale = 2 * math.pi
+
+        dim_t = torch.arange(self.d_model // 2, dtype=torch.float32)
+        dim_t = self.temp ** (2 * (dim_t // 2) / (self.d_model // 2))
+        self.register_buffer("dim_t", dim_t)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, C, H, W]
+        Returns:
+            pos: [1, C, H, W] (broadcastable)
+        """
+        B, C, H, W = x.shape
+        # 生成网格坐标
+        y_embed, x_embed = torch.meshgrid(torch.arange(H, device=x.device), torch.arange(W, device=x.device), indexing="ij")
+        y_embed = y_embed.float().unsqueeze(0) # [1, H, W]
+        x_embed = x_embed.float().unsqueeze(0) # [1, H, W]
+
+        # 归一化并缩放
+        eps = 1e-6
+        y_embed = y_embed / (H + eps) * self.scale
+        x_embed = x_embed / (W + eps) * self.scale
+
+        # 计算正弦编码
+        dim_t = self.dim_t
+        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, None] / dim_t
+
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+
+        # [1, H, W, C/2] -> [1, C/2, H, W]
+        pos_x = pos_x.permute(0, 3, 1, 2)
+        pos_y = pos_y.permute(0, 3, 1, 2)
+        
+        # 拼接
+        pos = torch.cat((pos_y, pos_x), dim=1) # [1, C, H, W]
+        return pos
+
+
 class AnatomicalBiasedAttention(nn.Module):
     """解剖偏置的多头注意力机制"""
     def __init__(self, d_model, n_heads, lambda_vessel=1.0):
@@ -202,6 +253,9 @@ class RoMaTransformer(nn.Module):
         # 锚点预测器
         self.anchor_predictor = AnchorPredictor(d_model, num_anchors)
         
+        # [Fix] 位置编码
+        self.pos_encoding = PositionEncodingSine(d_model)
+        
     def compute_vessel_bias(self, mask0, mask1):
         """
         计算血管偏置矩阵
@@ -261,6 +315,21 @@ class RoMaTransformer(nn.Module):
             mask1_down = F.interpolate(mask1, size=(H, W), mode='bilinear', align_corners=False)
             vessel_bias = self.compute_vessel_bias(mask0_down, mask1_down)
         
+        # [Fix] 添加位置编码
+        # 在展平之前添加位置编码，赋予 Transformer 空间感知能力
+        # feat0, feat1 目前是 [B, H*W, d_model]，需要先 reshape 回去或者在展平前加
+        
+        # 下面修正逻辑：在展平前加 positional encoding
+        feat0 = feat0.transpose(1, 2).reshape(B, self.d_model, H, W) # 还原回 [B, C, H, W]
+        feat1 = feat1.transpose(1, 2).reshape(B, self.d_model, H, W)
+        
+        feat0 = feat0 + self.pos_encoding(feat0)
+        feat1 = feat1 + self.pos_encoding(feat1)
+        
+        # 再次展平
+        feat0 = feat0.reshape(B, self.d_model, H*W).transpose(1, 2)
+        feat1 = feat1.reshape(B, self.d_model, H*W).transpose(1, 2)
+
         # 通过 Transformer 层
         for layer in self.layers:
             feat0, feat1 = layer(feat0, feat1, vessel_bias)
