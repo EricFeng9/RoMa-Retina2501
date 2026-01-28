@@ -142,9 +142,13 @@ class PL_RoMa(pl.LightningModule):
         
         return output
     
+    def on_validation_epoch_start(self):
+        """验证周期开始时初始化缓存"""
+        self.validation_step_outputs = []
+
     def on_validation_epoch_end(self):
-        """验证周期结束时清空缓存"""
-        self.validation_step_outputs.clear()
+        """验证周期结束"""
+        pass
     
     def _estimate_homography_batch(self, data, batch, batch_size):
         """
