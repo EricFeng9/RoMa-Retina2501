@@ -35,7 +35,15 @@ class PL_RoMa(pl.LightningModule):
         
         # 加载预训练权重
         if pretrained_ckpt:
-            state = torch.load(pretrained_ckpt, map_location='cpu')['state_dict']
+            checkpoint = torch.load(pretrained_ckpt, map_location='cpu')
+            # 兼容两种格式：
+            # 1. PyTorch Lightning checkpoint (包含 'state_dict' 键)
+            # 2. 普通 PyTorch 权重文件 (直接就是 state_dict)
+            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+                state = checkpoint['state_dict']
+            else:
+                # 假设整个文件就是 state_dict
+                state = checkpoint
             self.load_state_dict(state, strict=False)
             logger.info(f"从 {pretrained_ckpt} 加载预训练权重")
         
