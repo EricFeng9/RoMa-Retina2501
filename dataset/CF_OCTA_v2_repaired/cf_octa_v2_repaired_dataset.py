@@ -7,7 +7,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-SIZE = 512
+SIZE = 518
 
 # ============ 工具函数 (由 Scripts_v2/v14/registration_cf_octa.py 迁移) ============
 def load_affine_matrix(txt_path):

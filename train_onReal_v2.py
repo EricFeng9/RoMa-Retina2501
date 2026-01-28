@@ -21,7 +21,7 @@ root_dir = Path(__file__).parent.resolve()
 if str(root_dir) not in sys.path:
     sys.path.append(str(root_dir))
     
-from src.config.default import get_cfg_defaults
+from configs.roma_multimodal import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
 from src.utils.plotting import make_matching_figures
@@ -124,6 +124,7 @@ class PL_RoMa_Baseline_Real(PL_RoMa):
         # 将损失函数和后续处理需要的真值信息添加回去
         data['T_0to1'] = batch['T_0to1']
         data['image0'] = batch['image0']
+        data['dataset_name'] = batch.get('dataset_name', ['RealDataset'])  # 添加 dataset_name
         
         loss, metrics = self.loss_fn(data)
         batch_size = batch['image0'].shape[0]
@@ -145,24 +146,14 @@ class PL_RoMa_Baseline_Real(PL_RoMa):
 
         output = {
             'loss': loss.item(),
-            'loss_c': metrics['loss_c'].item(),
-            'loss_f': metrics['loss_f'].item(),
+            'loss_c': metrics['loss_c'],
+            'loss_f': metrics['loss_f'],
             'H_est': H_ests,
             'figures': figures,
             **auc_metrics
         }
         self.validation_step_outputs.append(output)
         return output
-
-    def validation_epoch_end(self, outputs):
-        # 记录平均 AUC (5, 10, 20)
-        auc5 = sum(x['auc@5'] for x in outputs) / len(outputs)
-        auc10 = sum(x['auc@10'] for x in outputs) / len(outputs)
-        auc20 = sum(x['auc@20'] for x in outputs) / len(outputs)
-        combined_auc = (auc5 + auc10 + auc20) / 3.0
-        self.log('auc@10', auc10, prog_bar=True, logger=True)
-        self.log('combined_auc', combined_auc, prog_bar=True, logger=True)
-        return super().validation_epoch_end(outputs)
 
 class MultimodalValidationCallback(Callback):
     def __init__(self, args, result_dir):
@@ -195,6 +186,15 @@ class MultimodalValidationCallback(Callback):
                 pass
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        outputs = pl_module.validation_step_outputs
+        if len(outputs) > 0:
+            auc5 = sum(x['auc@5'] for x in outputs) / len(outputs)
+            auc10 = sum(x['auc@10'] for x in outputs) / len(outputs)
+            auc20 = sum(x['auc@20'] for x in outputs) / len(outputs)
+            combined_auc = (auc5 + auc10 + auc20) / 3.0
+            pl_module.log('auc@10', auc10, prog_bar=True, logger=True)
+            pl_module.log('combined_auc', combined_auc, prog_bar=True, logger=True)
+
         if not self.epoch_mses: return
         
         avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
@@ -203,15 +203,15 @@ class MultimodalValidationCallback(Callback):
         loguru_logger.info(f"Epoch {epoch} Real Validation: MSE={avg_mse:.6f}")
         pl_module.log("val_mse_real", avg_mse, logger=True)
         
-        # 基于 Combined AUC 的最优模型保存 (与 v2.4_mix 对齐)
+        # 基于 Combined AUC 的最优模型保存
         metrics = trainer.callback_metrics
-        combined_auc = metrics.get('combined_auc', 0.0)
+        combined_auc_val = metrics.get('combined_auc', 0.0)
         
         is_best = False
-        if combined_auc > (getattr(self, 'best_auc', -1.0)):
-            self.best_auc = combined_auc
+        if combined_auc_val > (getattr(self, 'best_auc', -1.0)):
+            self.best_auc = combined_auc_val
             is_best = True
-            loguru_logger.info(f"New Best Real Model! Combined AUC={combined_auc:.4f}, MSE={avg_mse:.6f}")
+            loguru_logger.info(f"New Best Real Model! Combined AUC={combined_auc_val:.4f}, MSE={avg_mse:.6f}")
             best_path = self.result_dir / "best_checkpoint"
             best_path.mkdir(exist_ok=True)
             trainer.save_checkpoint(best_path / "model.ckpt")
@@ -325,11 +325,12 @@ def main():
     val_callback = MultimodalValidationCallback(args, str(result_dir))
     lr_monitor = LearningRateMonitor(logging_interval='step')
     # 对齐 v2.4_mix 监控 combined_auc (auc@5, 10, 20 的平均值)
-    early_stop = DelayedEarlyStopping(start_epoch=20, monitor='combined_auc', patience=15, mode='max')
+    early_stop = DelayedEarlyStopping(start_epoch=50, monitor='combined_auc', patience=10, mode='max')
     
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        gpus=_n_gpus,
+        accelerator="gpu" if _n_gpus > 0 else "cpu",
+        devices=_n_gpus if _n_gpus > 0 else "auto",
         callbacks=[val_callback, lr_monitor, early_stop],
         logger=tb_logger,
         check_val_every_n_epoch=1

@@ -21,7 +21,7 @@ root_dir = Path(__file__).parent.resolve()
 if str(root_dir) not in sys.path:
     sys.path.append(str(root_dir))
     
-from src.config.default import get_cfg_defaults
+from configs.roma_multimodal import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
 from dataset.FIVES_extract_v2.FIVES_extract_v2 import MultiModalDataset
@@ -102,10 +102,10 @@ class MultimodalDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
             # 训练集：生成数据
-            self.train_dataset = MultiModalDataset("data/FIVES_extract_v2", mode=self.args.mode, split='train', img_size=self.args.img_size)
+            self.train_dataset = MultiModalDataset("dataset/FIVES_extract_v2", mode=self.args.mode, split='train', img_size=self.args.img_size)
             
             # 验证集1：生成数据 (12组可视化)
-            self.val_dataset_gen = MultiModalDataset("data/FIVES_extract_v2", mode=self.args.mode, split='val', img_size=self.args.img_size)
+            self.val_dataset_gen = MultiModalDataset("dataset/FIVES_extract_v2", mode=self.args.mode, split='val', img_size=self.args.img_size)
             
             # 验证集2：真实数据 (全量评测指标)
             if self.args.mode == 'cffa':
@@ -161,6 +161,7 @@ class PL_RoMa_Baseline(PL_RoMa):
         data = self.model({'image0': batch['image0'], 'image1': batch['image1']})
         data['T_0to1'] = batch['T_0to1']
         data['image0'] = batch['image0']
+        data['dataset_name'] = batch.get('dataset_name', ['MultiModal'])  # 添加 dataset_name
         loss, metrics = self.loss_fn(data)
         batch_size = batch['image0'].shape[0]
         H_ests = self._estimate_homography_batch(data, batch, batch_size)
@@ -178,27 +179,15 @@ class PL_RoMa_Baseline(PL_RoMa):
             auc = (valid_errs < th).float().mean().item() if len(valid_errs) > 0 else 0.0
             auc_metrics[f'auc@{th}'] = auc
 
-        return {
+        output = {
+            'dataloader_idx': dataloader_idx,
             'loss': loss.item(),
             'H_est': H_ests,
             'figures': figures,
             **auc_metrics
         }
-
-    def validation_epoch_end(self, outputs):
-        # 对齐 v2.4_mix: 如果有多验证集，主指标强制只取第二个验证集（真实数据）
-        if isinstance(outputs, list) and len(outputs) > 1:
-            real_outputs = outputs[1]
-            # 计算平均 AUC (5, 10, 20) 用于综合评估
-            auc5 = sum(x['auc@5'] for x in real_outputs) / len(real_outputs)
-            auc10 = sum(x['auc@10'] for x in real_outputs) / len(real_outputs)
-            auc20 = sum(x['auc@20'] for x in real_outputs) / len(real_outputs)
-            combined_auc = (auc5 + auc10 + auc20) / 3.0
-            self.log('auc@10', auc10, prog_bar=True, logger=True)
-            self.log('combined_auc', combined_auc, prog_bar=True, logger=True)
-            return super().validation_epoch_end(real_outputs)
-        else:
-            return super().validation_epoch_end(outputs)
+        self.validation_step_outputs.append(output)
+        return output
 
 class MultimodalValidationCallback(Callback):
     def __init__(self, args, result_dir):
@@ -230,23 +219,34 @@ class MultimodalValidationCallback(Callback):
                 except: pass
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        outputs = pl_module.validation_step_outputs
+        outputs_real = [x for x in outputs if x.get('dataloader_idx') == 1]
+        
+        if len(outputs_real) > 0:
+            auc5 = sum(x['auc@5'] for x in outputs_real) / len(outputs_real)
+            auc10 = sum(x['auc@10'] for x in outputs_real) / len(outputs_real)
+            auc20 = sum(x['auc@20'] for x in outputs_real) / len(outputs_real)
+            combined_auc = (auc5 + auc10 + auc20) / 3.0
+            pl_module.log('auc@10', auc10, prog_bar=True, logger=True)
+            pl_module.log('combined_auc', combined_auc, prog_bar=True, logger=True)
+
         if not self.epoch_real_mses: return
         avg_mse = sum(self.epoch_real_mses) / len(self.epoch_real_mses)
         epoch = trainer.current_epoch + 1
         loguru_logger.info(f"Epoch {epoch} Real Validation Summary: MSE={avg_mse:.6f}")
         pl_module.log("val_mse_real", avg_mse, logger=True)
         
-        # 管理最佳模型保存 (基于 Combined AUC，同 v2.4_mix)
+        # 管理最佳模型保存
         metrics = trainer.callback_metrics
-        combined_auc = metrics.get('combined_auc', 0.0)
+        combined_auc_val = metrics.get('combined_auc', 0.0)
         is_best = False
-        if combined_auc > self.best_auc:
-            self.best_auc = combined_auc
+        if combined_auc_val > self.best_auc:
+            self.best_auc = combined_auc_val
             is_best = True
             best_path = self.result_dir / "best_checkpoint"
             best_path.mkdir(exist_ok=True)
             trainer.save_checkpoint(best_path / "model.ckpt")
-            loguru_logger.info(f"New Best Model! Combined AUC: {combined_auc:.4f}")
+            loguru_logger.info(f"New Best Model! Combined AUC: {combined_auc_val:.4f}")
 
         # 仅在 best checkpoint 或 每 5 个 epoch 触发可视化
         if is_best or epoch % 5 == 0:
@@ -342,10 +342,11 @@ def main():
     val_callback = MultimodalValidationCallback(args, str(result_dir))
     lr_monitor = LearningRateMonitor(logging_interval='step')
     # 对齐 v2.4_mix 监控 combined_auc (auc@5, 10, 20 的平均值)
-    early_stop = DelayedEarlyStopping(start_epoch=50, monitor='combined_auc', patience=15, mode='max')
+    early_stop = DelayedEarlyStopping(start_epoch=50, monitor='combined_auc', patience=10, mode='max')
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
-        gpus=_n_gpus,
+        accelerator="gpu" if _n_gpus > 0 else "cpu",
+        devices=_n_gpus if _n_gpus > 0 else "auto",
         callbacks=[val_callback, lr_monitor, early_stop],
         logger=tb_logger,
         check_val_every_n_epoch=1

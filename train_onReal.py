@@ -31,7 +31,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ca
 from pytorch_lightning.strategies import DDPStrategy
 import logging
 
-from src.config.default import get_cfg_defaults
+from configs.roma_multimodal import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
 from src.utils.plotting import make_matching_figures

@@ -104,7 +104,7 @@ def register_image(cond_img, cond_points, tgt_img, tgt_points):
     return registered_img, H
 
 # ============ CF_FA 数据集加载器 ============
-SIZE = 512
+SIZE = 518
 
 class CFFADataset(Dataset):
     """
