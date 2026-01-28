@@ -32,7 +32,7 @@ from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset imp
 from dataset.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
 from dataset.operation_pre_filtered_octfa.operation_pre_filtered_octfa_dataset import OCTFADataset
 
-# 日志配置
+# 日志配置 (对齐 v2.4_mix)
 loguru_logger = get_rank_zero_only_logger(logger)
 loguru_logger.remove()
 log_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
@@ -48,10 +48,73 @@ class InterceptHandler(logging.Handler):
         while frame.f_code.co_filename == logging.__file__:
             frame = frame.f_back
             depth += 1
-        loguru_logger.log(level, record.getMessage())
+        loguru_logger.opt(depth=depth, exception=record.exc_info).log(level, record.getMessage())
 
 logging.basicConfig(handlers=[InterceptHandler()], level=logging.INFO)
 logging.getLogger("matplotlib").setLevel(logging.ERROR)
+logging.getLogger("PIL").setLevel(logging.ERROR)
+
+def filter_valid_area(img1, img2):
+    """筛选有效区域：只保留两张图片都不为纯黑像素的部分，并裁剪使有效区域填满画布"""
+    assert img1.shape[:2] == img2.shape[:2], "两张图片的尺寸必须一致"
+    if len(img1.shape) == 3:
+        mask1 = np.any(img1 > 10, axis=2)
+    else:
+        mask1 = img1 > 0
+    if len(img2.shape) == 3:
+        mask2 = np.any(img2 > 10, axis=2)
+    else:
+        mask2 = img2 > 0
+    valid_mask = mask1 & mask2
+    rows = np.any(valid_mask, axis=1)
+    cols = np.any(valid_mask, axis=0)
+    if not np.any(rows) or not np.any(cols):
+        return img1, img2
+    row_min, row_max = np.where(rows)[0][[0, -1]]
+    col_min, col_max = np.where(cols)[0][[0, -1]]
+    filtered_img1 = img1[row_min:row_max+1, col_min:col_max+1].copy()
+    filtered_img2 = img2[row_min:row_max+1, col_min:col_max+1].copy()
+    valid_mask_cropped = valid_mask[row_min:row_max+1, col_min:col_max+1]
+    if len(filtered_img1.shape) == 3:
+        filtered_img1[~valid_mask_cropped] = 0
+    else:
+        filtered_img1[~valid_mask_cropped] = 0
+    if len(filtered_img2.shape) == 3:
+        filtered_img2[~valid_mask_cropped] = 0
+    else:
+        filtered_img2[~valid_mask_cropped] = 0
+    return filtered_img1, filtered_img2
+
+def compute_corner_error(H_est, H_gt, height, width):
+    """计算角点误差 (Corner Error)"""
+    corners = np.array([[0, 0], [width, 0], [width, height], [0, height]], dtype=np.float32)
+    corners_homo = np.concatenate([corners, np.ones((4, 1), dtype=np.float32)], axis=1)
+    corners_gt_homo = (H_gt @ corners_homo.T).T
+    corners_gt = corners_gt_homo[:, :2] / (corners_gt_homo[:, 2:] + 1e-6)
+    corners_est_homo = (H_est @ corners_homo.T).T
+    corners_est = corners_est_homo[:, :2] / (corners_est_homo[:, 2:] + 1e-6)
+    try:
+        errors = np.sqrt(np.sum((corners_est - corners_gt)**2, axis=1))
+        mace = np.mean(errors)
+    except:
+        mace = float('inf')
+    return mace
+
+def create_chessboard(img1, img2, grid_size=4):
+    """创建棋盘图"""
+    H, W = img1.shape
+    cell_h = H // grid_size
+    cell_w = W // grid_size
+    chessboard = np.zeros((H, W), dtype=img1.dtype)
+    for i in range(grid_size):
+        for j in range(grid_size):
+            y_start, y_end = i * cell_h, (i + 1) * cell_h
+            x_start, x_end = j * cell_w, (j + 1) * cell_w
+            if (i + j) % 2 == 0:
+                chessboard[y_start:y_end, x_start:x_end] = img1[y_start:y_end, x_start:x_end]
+            else:
+                chessboard[y_start:y_end, x_start:x_end] = img2[y_start:y_end, x_start:x_end]
+    return chessboard
 
 class RealDatasetWrapper(torch.utils.data.Dataset):
     def __init__(self, base_dataset):
@@ -160,70 +223,90 @@ class MultimodalValidationCallback(Callback):
         super().__init__()
         self.args = args
         self.result_dir = Path(result_dir)
-        self.best_mse = float('inf')
+        self.best_val = -1.0
         self.epoch_mses = []
+        self.epoch_maces = []
         
     def on_validation_epoch_start(self, trainer, pl_module):
         self.epoch_mses = []
+        self.epoch_maces = []
         pl_module.validation_step_outputs = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        batch_size = batch['image0'].shape[0]
-        H_ests = outputs['H_est']
-        
-        for i in range(batch_size):
-            H_est = H_ests[i]
-            img1_warp = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            img1_gt = (batch['image1_gt'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-            
-            h, w = img1_gt.shape
-            try:
-                H_inv = np.linalg.inv(H_est)
-                img1_res = cv2.warpPerspective(img1_warp, H_inv, (w, h))
-                mse = np.mean(((img1_res/255.0) - (img1_gt/255.0))**2)
-                self.epoch_mses.append(mse)
-            except:
-                pass
+        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, None, save_images=False)
+        self.epoch_mses.extend(batch_mses)
+        self.epoch_maces.extend(batch_maces)
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch + 1
+        metrics = trainer.callback_metrics
+        display_metrics = {}
+        for k in ['loss', 'train/loss_c', 'train/loss_f']:
+            epoch_key = f"{k}_epoch"
+            if epoch_key in metrics:
+                name = k.replace('train/', '')
+                display_metrics[name] = metrics[epoch_key].item()
+            elif k in metrics:
+                name = k.replace('train/', '')
+                display_metrics[name] = metrics[k].item()
+        if display_metrics:
+            metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
+            loguru_logger.info(f"Epoch {epoch} 训练总结 >> {metric_str}")
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        outputs = pl_module.validation_step_outputs
-        if len(outputs) > 0:
-            auc5 = sum(x['auc@5'] for x in outputs) / len(outputs)
-            auc10 = sum(x['auc@10'] for x in outputs) / len(outputs)
-            auc20 = sum(x['auc@20'] for x in outputs) / len(outputs)
-            combined_auc = (auc5 + auc10 + auc20) / 3.0
-            pl_module.log('auc@10', auc10, prog_bar=True, logger=True)
-            pl_module.log('combined_auc', combined_auc, prog_bar=True, logger=True)
-
         if not self.epoch_mses: return
         
         avg_mse = sum(self.epoch_mses) / len(self.epoch_mses)
+        avg_mace = sum(self.epoch_maces) / len(self.epoch_maces) if self.epoch_maces else float('inf')
+        
         epoch = trainer.current_epoch + 1
-        
-        loguru_logger.info(f"Epoch {epoch} Real Validation: MSE={avg_mse:.6f}")
-        pl_module.log("val_mse_real", avg_mse, logger=True)
-        
-        # 基于 Combined AUC 的最优模型保存
         metrics = trainer.callback_metrics
-        combined_auc_val = metrics.get('combined_auc', 0.0)
         
+        display_metrics = {'mse_real': avg_mse, 'mace_real': avg_mace}
+        for k in ['auc@5', 'auc@10', 'auc@20']:
+            outputs = pl_module.validation_step_outputs
+            if len(outputs) > 0:
+                display_metrics[k] = sum(x[k] for x in outputs) / len(outputs)
+        
+        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
+        loguru_logger.info(f"Epoch {epoch} 验证总结 >> {metric_str}")
+        
+        pl_module.log("val_mse", avg_mse, on_epoch=True, prog_bar=False, logger=True)
+        pl_module.log("val_mace", avg_mace, on_epoch=True, prog_bar=True, logger=True)
+        
+        latest_path = self.result_dir / "latest_checkpoint"
+        latest_path.mkdir(exist_ok=True)
+        trainer.save_checkpoint(latest_path / "model.ckpt")
+        with open(latest_path / "log.txt", "w") as f:
+            f.write(f"Epoch: {epoch}\nLatest MSE: {avg_mse:.6f}\nLatest MACE: {avg_mace:.4f}")
+            
         is_best = False
-        if combined_auc_val > (getattr(self, 'best_auc', -1.0)):
-            self.best_auc = combined_auc_val
+        auc5 = display_metrics.get('auc@5', 0.0)
+        auc10 = display_metrics.get('auc@10', 0.0)
+        auc20 = display_metrics.get('auc@20', 0.0)
+        combined_auc = (auc5 + auc10 + auc20) / 3.0
+        
+        # 将 combined_auc log 到模型中，以便 EarlyStopping 监控
+        pl_module.log('combined_auc', combined_auc, on_epoch=True, prog_bar=True, logger=True)
+
+        if combined_auc > self.best_val:
+            self.best_val = combined_auc
             is_best = True
-            loguru_logger.info(f"New Best Real Model! Combined AUC={combined_auc_val:.4f}, MSE={avg_mse:.6f}")
             best_path = self.result_dir / "best_checkpoint"
             best_path.mkdir(exist_ok=True)
             trainer.save_checkpoint(best_path / "model.ckpt")
+            with open(best_path / "log.txt", "w") as f:
+                f.write(f"Epoch: {epoch}\nBest Combined AUC: {combined_auc:.4f}\nAUC@10: {auc10:.4f}\nMSE: {avg_mse:.6f}\nMACE: {avg_mace:.4f}")
+            loguru_logger.info(f"发现新的最优模型! Epoch {epoch}, 综合 AUC: {combined_auc:.4f}")
 
-        # 仅在 best checkpoint 或 每 5 个 epoch 触发可视化
-        if is_best or epoch % 5 == 0:
-            self._trigger_visualization(trainer, pl_module, epoch, is_best=is_best)
+        if is_best or (epoch % 5 == 0):
+            self._trigger_visualization(trainer, pl_module, epoch, is_best)
 
     def _trigger_visualization(self, trainer, pl_module, epoch, is_best=False):
-        suffix = "_best" if is_best else ""
-        loguru_logger.info(f"Triggering Visualization for Epoch {epoch}{suffix}...")
+        loguru_logger.info(f"正在为 Epoch {epoch} 生成可视化结果...")
         pl_module.force_viz = True
+        
+        suffix = "_best" if is_best else ""
         save_path = self.result_dir / f"epoch_{epoch}{suffix}"
         save_path.mkdir(parents=True, exist_ok=True)
         
@@ -235,37 +318,67 @@ class MultimodalValidationCallback(Callback):
             for batch_idx, batch in enumerate(dl):
                 batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 outputs = pl_module.validation_step(batch, batch_idx)
-                
-                # 保存可视化图像
-                batch_size = batch['image0'].shape[0]
-                H_ests = outputs['H_est']
-                pair_names0 = batch['pair_names'][0]
-                pair_names1 = batch['pair_names'][1]
-                
-                for i in range(batch_size):
-                    sample_name = f"{Path(pair_names0[i]).stem}_vs_{Path(pair_names1[i]).stem}"
-                    img_dir = save_path / sample_name
-                    img_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-                    img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
-                    
-                    h, w = img0.shape
-                    try:
-                        H_inv = np.linalg.inv(H_ests[i])
-                        img1_res = cv2.warpPerspective(img1, H_inv, (w, h))
-                    except:
-                        img1_res = img1.copy()
+                self._process_batch(trainer, pl_module, batch, outputs, save_path, save_images=True)
                         
-                    cv2.imwrite(str(img_dir / "fix.png"), img0)
-                    cv2.imwrite(str(img_dir / "moving_warp.png"), img1)
-                    cv2.imwrite(str(img_dir / "result.png"), img1_res)
-                    
-                    if 'figures' in outputs and 'evaluation' in outputs['figures'] and len(outputs['figures']['evaluation']) > i:
-                        fig = outputs['figures']['evaluation'][i]
-                        fig.savefig(str(img_dir / "matches.png"), bbox_inches='tight')
-                        plt.close(fig)
         pl_module.force_viz = False
+
+    def _process_batch(self, trainer, pl_module, batch, outputs, epoch_dir, save_images=False):
+        batch_size = batch['image0'].shape[0]
+        mses = []
+        maces = []
+        H_ests = outputs.get('H_est', [np.eye(3)] * batch_size)
+        Ts_gt = batch['T_0to1'].cpu().numpy()
+        pair_names0 = batch['pair_names'][0]
+        pair_names1 = batch['pair_names'][1]
+        
+        for i in range(batch_size):
+            H_est = H_ests[i]
+            img0 = (batch['image0'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+            img1 = (batch['image1'][i, 0].cpu().numpy() * 255).astype(np.uint8)
+            ref_key = 'image1_gt' if 'image1_gt' in batch else 'image1'
+            img1_gt = (batch[ref_key][i, 0].cpu().numpy() * 255).astype(np.uint8)
+            
+            h, w = img0.shape
+            try:
+                H_inv = np.linalg.inv(H_est)
+                img1_result = cv2.warpPerspective(img1, H_inv, (w, h))
+            except:
+                img1_result = img1.copy()
+                
+            try:
+                res_f, orig_f = filter_valid_area(img1_result, img1_gt)
+                mask = (res_f > 0)
+                mse = np.mean(((res_f[mask]/255.)-(orig_f[mask]/255.))**2) if np.any(mask) else 0.0
+            except:
+                mse = 0.0
+            mses.append(mse)
+            
+            mace = compute_corner_error(H_est, Ts_gt[i], h, w)
+            maces.append(mace)
+            
+            if not save_images: continue
+                
+            sample_name = f"{Path(pair_names0[i]).stem}_vs_{Path(pair_names1[i]).stem}"
+            save_path = epoch_dir / sample_name
+            save_path.mkdir(parents=True, exist_ok=True)
+
+            cv2.imwrite(str(save_path / "fix.png"), img0)
+            cv2.imwrite(str(save_path / "moving.png"), img1)
+            cv2.imwrite(str(save_path / "moving_result.png"), img1_result)
+            
+            try:
+                cb = create_chessboard(img1_result, img0)
+                cv2.imwrite(str(save_path / "chessboard.png"), cb)
+            except: pass
+            
+            try:
+                if 'figures' in outputs and 'evaluation' in outputs['figures'] and len(outputs['figures']['evaluation']) > i:
+                    fig = outputs['figures']['evaluation'][i]
+                    fig.savefig(str(save_path / "matches.png"), bbox_inches='tight')
+                    plt.close(fig)
+            except: pass
+            
+        return mses, maces
 
 class DelayedEarlyStopping(EarlyStopping):
     def __init__(self, start_epoch=50, *args, **kwargs):
@@ -301,6 +414,7 @@ def main():
     
     result_dir = Path(f"results/{args.mode}/{args.name}")
     result_dir.mkdir(parents=True, exist_ok=True)
+    loguru_logger.add(result_dir / "log.txt", enqueue=True, mode="a")
     
     model = PL_RoMa_Baseline_Real(config)
     
