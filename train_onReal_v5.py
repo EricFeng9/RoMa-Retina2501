@@ -439,7 +439,6 @@ def parse_args():
     parser.add_argument('--img_size', type=int, default=518)
     parser.add_argument('--max_epochs', type=int, default=100)
     parser.add_argument('--gpus', type=str, default='1')
-    parser.add_argument('--gpus', type=str, default='1')
     return parser.parse_args()
 
 def main():
