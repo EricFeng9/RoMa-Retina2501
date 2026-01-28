@@ -130,21 +130,16 @@ class MultiModalDataset(Dataset):
     def __len__(self):
         return len(self.valid_dirs)
 
-    def _compute_soft_vessel_weight(self, vessel_mask_bin):
+    def _compute_vessel_weight(self, vessel_mask_bin):
         """
-        基于二值血管掩码计算高斯软掩码:
-        1. 对反掩码做距离变换，得到每个像素到最近血管的距离 D(x)
-        2. 使用高斯核 W(x) = exp(-D(x)^2 / (2*sigma^2)), sigma 以像素为单位
+        基于二值血管掩码计算硬权重 (Hard Weighting):
+        - In-Vessel (前景): 10.0
+        - Background (背景): 1.0
+        策略: 强迫模型关注血管特征。
         """
-        # vessel_mask_bin: [H, W], 0/1
-        inv_mask = (1 - vessel_mask_bin).astype(np.uint8)
-        # OpenCV distanceTransform 要求非零为前景，这里用反掩码，保证血管内部 D=0
-        dist = cv2.distanceTransform(inv_mask, distanceType=cv2.DIST_L2, maskSize=3)
-        sigma = max(self.vessel_sigma, 1e-3)
-        # 为避免数值下溢，可裁剪最大距离（3*sigma 之后权重已接近 0）
-        max_dist = 3.0 * sigma
-        dist = np.clip(dist, 0.0, max_dist)
-        weight = np.exp(-(dist ** 2) / (2 * sigma * sigma))
+        # vessel_mask_bin: [H, W], 0.0 or 1.0
+        # Weight = 1.0 + (10.0 - 1.0) * mask
+        weight = 1.0 + 9.0 * vessel_mask_bin
         return weight.astype(np.float32)
 
     def _get_random_affine(self, rng=None):
@@ -196,8 +191,8 @@ class MultiModalDataset(Dataset):
         
         # 二值化掩码 (0/1)
         vessel_mask_bin = (vessel_mask > 127).astype(np.float32)
-        # 基于二值掩码计算高斯软掩码 (固定图上的权重)
-        vessel_weight0 = self._compute_soft_vessel_weight(vessel_mask_bin)
+        # 基于二值掩码计算硬权重图 (固定图上的权重) 1.0 vs 10.0
+        vessel_weight0 = self._compute_vessel_weight(vessel_mask_bin)
         
         # 原始移动图 (未形变)
         img1_origin = img1.copy()

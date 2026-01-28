@@ -115,7 +115,16 @@ class RoMaLoss(nn.Module):
         
         # 梯度保底：引入血管权重
         # 按照图片要求，使用 torch.clamp(mask, min=0.1) 作为损失权重系统
-        if 'mask0' in data:
+        if 'vessel_weight0' in data:
+            # 使用预计算的 Vessel Weight (1.0 vs 10.0)
+            weight_map = data['vessel_weight0'].squeeze(1) # [B, H, W]
+            # 下采样到粗级分辨率
+            weight_map_down = F.interpolate(
+                weight_map.unsqueeze(1), size=(H, W), 
+                mode='bilinear', align_corners=False
+            ).squeeze(1)  # [B, H, W]
+            loss_weight = weight_map_down.reshape(B, -1) # [B, N0]
+        elif 'mask0' in data:
             vessel_mask = data['mask0'].squeeze(1)  # [B, H, W]
             # 下采样到粗级分辨率
             vessel_mask_down = F.interpolate(
@@ -181,6 +190,29 @@ class RoMaLoss(nn.Module):
             # Charbonnier 损失
             diff = pts1_b - pts1_gt
             loss_b = ((diff ** 2).sum(dim=-1) + self.smooth_param) ** 0.25
+            
+            # --- 新增 Fine Level 加权 ---
+            if 'vessel_weight0' in data:
+                 # 取出对应的权重图
+                w_map = data['vessel_weight0'][b]  # [1, H, W]
+                
+                # 为 mkpts0 (pts0_b) 采样权重
+                # pts0_b: [M_b, 3] (x, y, 1), 坐标是归一化前的像素坐标
+                # grid_sample 需要 [-1, 1] 的 grid
+                H, W = w_map.shape[1], w_map.shape[2]
+                
+                # Normalize coordinates to [-1, 1] for grid_sample
+                # (x / (W-1)) * 2 - 1
+                norm_x = (pts0_b[:, 0] / (W - 1)) * 2 - 1
+                norm_y = (pts0_b[:, 1] / (H - 1)) * 2 - 1
+                grid = torch.stack([norm_x, norm_y], dim=-1).unsqueeze(0).unsqueeze(0) # [1, 1, M_b, 2]
+                
+                # Sample weights
+                sampled_weights = F.grid_sample(w_map.unsqueeze(0), grid, align_corners=True, mode='bilinear') # [1, 1, 1, M_b]
+                weights = sampled_weights.squeeze().reshape(-1) # [M_b]
+                
+                loss_b = loss_b * weights
+            
             losses.append(loss_b.mean())
         
         if len(losses) == 0:
