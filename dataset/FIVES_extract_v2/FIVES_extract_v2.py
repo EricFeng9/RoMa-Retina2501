@@ -130,16 +130,21 @@ class MultiModalDataset(Dataset):
     def __len__(self):
         return len(self.valid_dirs)
 
-    def _compute_vessel_weight(self, vessel_mask_bin):
+    def _compute_vessel_weight(self, vessel_mask_bin, valid_mask):
         """
         基于二值血管掩码计算硬权重 (Hard Weighting):
         - In-Vessel (前景): 10.0
-        - Background (背景): 1.0
-        策略: 强迫模型关注血管特征。
+        - Retina Background (眼底背景): 1.0
+        - Padding (黑边填充): 0.0 (忽略)
+        策略: 强迫模型关注血管特征，同时忽略无效的黑边区域。
         """
         # vessel_mask_bin: [H, W], 0.0 or 1.0
         # Weight = 1.0 + (10.0 - 1.0) * mask
         weight = 1.0 + 9.0 * vessel_mask_bin
+        
+        # 关键修正：将无效区域（黑边）的权重设为 0
+        weight = weight * valid_mask
+        
         return weight.astype(np.float32)
 
     def _get_random_affine(self, rng=None):
@@ -191,8 +196,13 @@ class MultiModalDataset(Dataset):
         
         # 二值化掩码 (0/1)
         vessel_mask_bin = (vessel_mask > 127).astype(np.float32)
-        # 基于二值掩码计算硬权重图 (固定图上的权重) 1.0 vs 10.0
-        vessel_weight0 = self._compute_vessel_weight(vessel_mask_bin)
+        
+        # [Moved Up] 计算有效区域掩码 (整个眼底可见区域)
+        valid_mask0_orig = (img0 > 10).astype(np.float32)
+        
+        # 基于二值掩码计算硬权重图 (固定图上的权重)
+        # In-Vessel=10.0, Retina-BG=1.0, Padding=0.0
+        vessel_weight0 = self._compute_vessel_weight(vessel_mask_bin, valid_mask0_orig)
         
         # 原始移动图 (未形变)
         img1_origin = img1.copy()
@@ -206,9 +216,8 @@ class MultiModalDataset(Dataset):
             else:
                 T, flip_h, flip_v = self._get_random_affine()
             
-            # 方案B: 建立有效区域掩码 (整个眼底可见区域，用于Transformer注意力)
-            # 使用简单的阈值提取眼底轮廓
-            valid_mask0_orig = (img0 > 10).astype(np.float32)
+            # [Removed Duplicate Logic]
+            valid_mask1_orig = (img1 > 10).astype(np.float32)
             valid_mask1_orig = (img1 > 10).astype(np.float32)
             
             # 同步变换图像和掩码 / 软权重 / 有效区域掩码
