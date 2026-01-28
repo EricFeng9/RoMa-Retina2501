@@ -8,7 +8,7 @@ import numpy as np
 
 # Changed Import
 from .backbone.roma_backbone_superPoints import RoMaBackbone
-from .loftr_module.roma_transformer import RoMaTransformer
+from .loftr_module.roma_transformer_superPoints import RoMaTransformer
 
 
 class FineMatching(nn.Module):
