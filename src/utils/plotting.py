@@ -177,7 +177,13 @@ def visualize_feature_maps(feat, save_path, title=None):
     # 应用彩色映射
     am_color = cv2.applyColorMap(am, cv2.COLORMAP_JET)
     
+    # [修复] 如果图片尺寸太小（如 coarse 阶段的 37x37），putText 的文字会遮挡整张图
+    # 统一放大到 512x512 进行可视化
+    target_size = 512
+    am_color = cv2.resize(am_color, (target_size, target_size), interpolation=cv2.INTER_NEAREST)
+    
     if title:
-        cv2.putText(am_color, title, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        # 在放大后的图上写字，位置 (10, 40)
+        cv2.putText(am_color, title, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
         
     cv2.imwrite(str(save_path), am_color)

@@ -24,9 +24,11 @@ if str(root_dir) not in sys.path:
 from configs.roma_multimodal import get_cfg_defaults
 from src.utils.misc import get_rank_zero_only_logger, setup_gpus
 from src.lightning.lightning_roma import PL_RoMa
+from dataset.FIVES_extract_v2.FIVES_extract_v2 import MultiModalDataset
+from gen_data_enhance_v2 import apply_domain_randomization, save_batch_visualization
 from src.utils.plotting import make_matching_figures
 
-# 导入真实数据集
+# 导入真实数据集用于验证
 from dataset.CF_OCTA_v2_repaired.cf_octa_v2_repaired_dataset import CFOCTADataset
 from dataset.operation_pre_filtered_cffa.operation_pre_filtered_cffa_dataset import CFFADataset
 from dataset.operation_pre_filtered_cfoct.operation_pre_filtered_cfoct_dataset import CFOCTDataset
@@ -149,55 +151,88 @@ class RealDatasetWrapper(torch.utils.data.Dataset):
             'dataset_name': 'RealDataset'
         }
 
-class PL_RoMa_Baseline_Real(PL_RoMa):
-    def __init__(self, config, pretrained_ckpt=None):
+class MultimodalDataModule(pl.LightningDataModule):
+    def __init__(self, args, config):
+        super().__init__()
+        self.args = args
+        self.config = config
+        self.loader_params = {
+            'batch_size': args.batch_size,
+            'num_workers': args.num_workers,
+            'pin_memory': True
+        }
+
+    def setup(self, stage=None):
+        if stage == 'fit' or stage is None:
+            # 训练集：生成数据
+            self.train_dataset = MultiModalDataset("dataset/FIVES_extract_v2", mode=self.args.mode, split='train', img_size=self.args.img_size)
+            
+            # 验证集1：生成数据 (12组可视化)
+            self.val_dataset_gen = MultiModalDataset("dataset/FIVES_extract_v2", mode=self.args.mode, split='val', img_size=self.args.img_size)
+            
+            # 验证集2：真实数据 (全量评测指标)
+            if self.args.mode == 'cffa':
+                val_base = CFFADataset(root_dir='dataset/operation_pre_filtered_cffa', split='val', mode='fa2cf')
+            elif self.args.mode == 'cfoct':
+                val_base = CFOCTDataset(root_dir='dataset/operation_pre_filtered_cfoct', split='val', mode='cf2oct')
+            elif self.args.mode == 'octfa':
+                val_base = OCTFADataset(root_dir='dataset/operation_pre_filtered_octfa', split='val', mode='fa2oct')
+            elif self.args.mode == 'cfocta':
+                val_base = CFOCTADataset(root_dir='dataset/CF_OCTA_v2_repaired', split='val', mode='cf2octa')
+            
+            self.val_dataset_real = RealDatasetWrapper(val_base)
+
+    def train_dataloader(self):
+        return torch.utils.data.DataLoader(self.train_dataset, shuffle=True, **self.loader_params)
+
+    def val_dataloader(self):
+        # 返回双验证集：生成数据(idx=0), 真实数据(idx=1)
+        return [
+            torch.utils.data.DataLoader(self.val_dataset_gen, shuffle=False, **self.loader_params),
+            torch.utils.data.DataLoader(self.val_dataset_real, shuffle=False, **self.loader_params)
+        ]
+
+class PL_RoMa_Baseline(PL_RoMa):
+    def __init__(self, config, pretrained_ckpt=None, use_domain_rand=True, result_dir=None):
         super().__init__(config, pretrained_ckpt)
+        self.use_domain_rand = use_domain_rand
+        self.result_dir = result_dir
         
     def optimizer_step(self, *args, **kwargs):
-        # Baseline 不使用课程学习
         pl.LightningModule.optimizer_step(self, *args, **kwargs)
 
     def training_step(self, batch, batch_idx):
-        # 真实数据训练：Baseline 不传入任何 mask
-        model_input = {
-            'image0': batch['image0'],
-            'image1': batch['image1']
-        }
+        if self.use_domain_rand:
+            img0_orig = batch['image0'].clone()
+            img1_orig = batch['image1'].clone()
+            batch['image0'] = apply_domain_randomization(batch['image0'])
+            batch['image1'] = apply_domain_randomization(batch['image1'])
+            if self.current_epoch == 0 and batch_idx < 2 and self.result_dir:
+                save_batch_visualization(
+                    img0_orig, img1_orig, batch['image0'], batch['image1'],
+                    self.result_dir, epoch=0, step=batch_idx, batch_size=batch['image0'].shape[0]
+                )
+        model_input = {'image0': batch['image0'], 'image1': batch['image1']}
         data = self.model(model_input)
-        
-        # 将损失函数和后续处理需要的真值信息添加回去
         data['T_0to1'] = batch['T_0to1']
         data['image0'] = batch['image0']
-        
         loss, metrics = self.loss_fn(data)
-        
         self.log('loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        self.log('train/loss_c', metrics['loss_c'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        self.log('train/loss_f', metrics['loss_f'], on_step=True, on_epoch=True, prog_bar=False, logger=True)
-        
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
-        model_input = {
-            'image0': batch['image0'],
-            'image1': batch['image1']
-        }
-        data = self.model(model_input)
-        
-        # 将损失函数和后续处理需要的真值信息添加回去
+        data = self.model({'image0': batch['image0'], 'image1': batch['image1']})
         data['T_0to1'] = batch['T_0to1']
         data['image0'] = batch['image0']
-        data['dataset_name'] = batch.get('dataset_name', ['RealDataset'])  # 添加 dataset_name
-        
+        data['dataset_name'] = batch.get('dataset_name', ['MultiModal'])  # 添加 dataset_name
         loss, metrics = self.loss_fn(data)
         batch_size = batch['image0'].shape[0]
         H_ests = self._estimate_homography_batch(data, batch, batch_size)
-        
         figures = {}
         if getattr(self, 'force_viz', False):
             data['H_est'] = H_ests
             figures = make_matching_figures(data, self.config, mode='evaluation')
-            
+        
         # 计算对齐 v2.4_mix 的 auc 指标
         from src.utils.metrics import compute_symmetrical_epipolar_errors
         compute_symmetrical_epipolar_errors(data)
@@ -208,9 +243,8 @@ class PL_RoMa_Baseline_Real(PL_RoMa):
             auc_metrics[f'auc@{th}'] = auc
 
         output = {
+            'dataloader_idx': dataloader_idx,
             'loss': loss.item(),
-            'loss_c': metrics['loss_c'],
-            'loss_f': metrics['loss_f'],
             'H_est': H_ests,
             'figures': figures,
             'feat_c0': data.get('feat_c0'),
@@ -232,16 +266,18 @@ class MultimodalValidationCallback(Callback):
         self.best_val = -1.0
         self.epoch_mses = []
         self.epoch_maces = []
-        
+
     def on_validation_epoch_start(self, trainer, pl_module):
         self.epoch_mses = []
         self.epoch_maces = []
         pl_module.validation_step_outputs = []
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, None, save_images=False)
-        self.epoch_mses.extend(batch_mses)
-        self.epoch_maces.extend(batch_maces)
+        # 仅对真实数据记录指标
+        if dataloader_idx == 1:
+            batch_mses, batch_maces = self._process_batch(trainer, pl_module, batch, outputs, None, save_images=False)
+            self.epoch_mses.extend(batch_mses)
+            self.epoch_maces.extend(batch_maces)
 
     def on_train_epoch_end(self, trainer, pl_module):
         epoch = trainer.current_epoch + 1
@@ -270,12 +306,16 @@ class MultimodalValidationCallback(Callback):
         
         display_metrics = {'mse_real': avg_mse, 'mace_real': avg_mace}
         for k in ['auc@5', 'auc@10', 'auc@20']:
+            # 从 PL 模型记录的平均指标中拿
+            # 注意：PL 会自动聚合 validation_step 的输出
+            # 这里我们手动计算 outputs 来获取更准确的真实数据指标
             outputs = pl_module.validation_step_outputs
-            if len(outputs) > 0:
-                display_metrics[k] = sum(x[k] for x in outputs) / len(outputs)
+            outputs_real = [x for x in outputs if x.get('dataloader_idx') == 1]
+            if len(outputs_real) > 0:
+                display_metrics[k] = sum(x[k] for x in outputs_real) / len(outputs_real)
         
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in display_metrics.items()])
-        loguru_logger.info(f"Epoch {epoch} 验证总结 >> {metric_str}")
+        loguru_logger.info(f"Epoch {epoch} 验证总结（真实数据） >> {metric_str}")
         
         pl_module.log("val_mse", avg_mse, on_epoch=True, prog_bar=False, logger=True)
         pl_module.log("val_mace", avg_mace, on_epoch=True, prog_bar=True, logger=True)
@@ -308,23 +348,28 @@ class MultimodalValidationCallback(Callback):
         if is_best or (epoch % 5 == 0):
             self._trigger_visualization(trainer, pl_module, epoch, is_best)
 
-    def _trigger_visualization(self, trainer, pl_module, epoch, is_best=False):
+    def _trigger_visualization(self, trainer, pl_module, epoch, is_best):
         loguru_logger.info(f"正在为 Epoch {epoch} 生成可视化结果...")
         pl_module.force_viz = True
         
         suffix = "_best" if is_best else ""
-        save_path = self.result_dir / f"epoch_{epoch}{suffix}"
-        save_path.mkdir(parents=True, exist_ok=True)
+        target_dir = self.result_dir / f"epoch{epoch}{suffix}"
+        target_dir.mkdir(parents=True, exist_ok=True)
         
-        dl = trainer.val_dataloaders
-        if dl is None: return
+        val_dataloaders = trainer.val_dataloaders
+        if val_dataloaders is None: return
         
         pl_module.eval()
         with torch.no_grad():
-            for batch_idx, batch in enumerate(dl):
-                batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                outputs = pl_module.validation_step(batch, batch_idx)
-                self._process_batch(trainer, pl_module, batch, outputs, save_path, save_images=True)
+            for dl_idx, dl in enumerate(val_dataloaders):
+                dl_name = "gen" if dl_idx == 0 else "real"
+                sub_dir = target_dir / dl_name
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                
+                for batch_idx, batch in enumerate(dl):
+                    batch = {k: v.to(pl_module.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                    outputs = pl_module.validation_step(batch, batch_idx, dl_idx)
+                    self._process_batch(trainer, pl_module, batch, outputs, sub_dir, save_images=True)
                         
         pl_module.force_viz = False
 
@@ -395,7 +440,7 @@ class MultimodalValidationCallback(Callback):
                     visualize_feature_maps(outputs['feat_f0'][i:i+1], save_path / "feat_fine_fix.png", title="Fine Fix")
                 if 'feat_f1' in outputs and outputs['feat_f1'] is not None:
                     visualize_feature_maps(outputs['feat_f1'][i:i+1], save_path / "feat_fine_mov.png", title="Fine Mov")
-                
+
                 # [新增] 适配图可视化 (DINOv2 Input)
                 if 'x_adapted0' in outputs and outputs['x_adapted0'] is not None:
                     img_ada = (outputs['x_adapted0'][i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
@@ -416,58 +461,37 @@ class DelayedEarlyStopping(EarlyStopping):
             super().on_validation_end(trainer, pl_module)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RoMa Baseline Training on Real Data")
+    parser = argparse.ArgumentParser(description="RoMa Baseline Training on Generated Data")
     parser.add_argument('--mode', type=str, default='cffa', choices=['cffa', 'cfoct', 'octfa', 'cfocta'])
-    parser.add_argument('--name', '-n', type=str, default='roma_baseline_real')
+    parser.add_argument('--name', '-n', type=str, default='roma_baseline_gen')
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=8)
     parser.add_argument('--img_size', type=int, default=518)
-    parser.add_argument('--max_epochs', type=int, default=100)
+    parser.add_argument('--max_epochs', type=int, default=200)
     parser.add_argument('--gpus', type=str, default='1')
+    parser.add_argument('--pretrained_ckpt', type=str, default='weights/romav2.pt.1', help='Path to pretrained checkpoints')
     return parser.parse_args()
 
 def main():
     args = parse_args()
     config = get_cfg_defaults()
-    
     config.defrost()
     config.ROMA.LAMBDA_VESSEL = 0.0
     config.DATASET.MGDPT_IMG_RESIZE = args.img_size
     config.TRAINER.SEED = 66
     config.freeze()
-    
     pl.seed_everything(config.TRAINER.SEED)
     _n_gpus = setup_gpus(args.gpus)
-    
     result_dir = Path(f"results/{args.mode}/{args.name}")
     result_dir.mkdir(parents=True, exist_ok=True)
     loguru_logger.add(result_dir / "log.txt", enqueue=True, mode="a")
-    
-    model = PL_RoMa_Baseline_Real(config)
-    
-    # 根据模式选择真实数据集
-    if args.mode == 'cffa':
-        train_base = CFFADataset(root_dir='dataset/operation_pre_filtered_cffa', split='train', mode='fa2cf')
-        val_base = CFFADataset(root_dir='dataset/operation_pre_filtered_cffa', split='val', mode='fa2cf')
-    elif args.mode == 'cfoct':
-        train_base = CFOCTDataset(root_dir='dataset/operation_pre_filtered_cfoct', split='train', mode='cf2oct')
-        val_base = CFOCTDataset(root_dir='dataset/operation_pre_filtered_cfoct', split='val', mode='cf2oct')
-    elif args.mode == 'octfa':
-        train_base = OCTFADataset(root_dir='dataset/operation_pre_filtered_octfa', split='train', mode='fa2oct')
-        val_base = OCTFADataset(root_dir='dataset/operation_pre_filtered_octfa', split='val', mode='fa2oct')
-    elif args.mode == 'cfocta':
-        train_base = CFOCTADataset(root_dir='dataset/CF_OCTA_v2_repaired', split='train', mode='cf2octa')
-        val_base = CFOCTADataset(root_dir='dataset/CF_OCTA_v2_repaired', split='val', mode='cf2octa')
-
-    train_loader = torch.utils.data.DataLoader(RealDatasetWrapper(train_base), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
-    val_loader = torch.utils.data.DataLoader(RealDatasetWrapper(val_base), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    
+    model = PL_RoMa_Baseline(config, pretrained_ckpt=args.pretrained_ckpt, use_domain_rand=True, result_dir=str(result_dir))
+    data_module = MultimodalDataModule(args, config)
     tb_logger = TensorBoardLogger(save_dir='logs/tb_logs', name=args.name)
     val_callback = MultimodalValidationCallback(args, str(result_dir))
     lr_monitor = LearningRateMonitor(logging_interval='step')
     # 对齐 v2.4_mix 监控 combined_auc (auc@5, 10, 20 的平均值)
     early_stop = DelayedEarlyStopping(start_epoch=50, monitor='combined_auc', patience=10, mode='max')
-    
     trainer = pl.Trainer(
         max_epochs=args.max_epochs,
         accelerator="gpu" if _n_gpus > 0 else "cpu",
@@ -476,9 +500,8 @@ def main():
         logger=tb_logger,
         check_val_every_n_epoch=1
     )
-    
-    loguru_logger.info(f"Starting Real Baseline Training: {args.name} in mode {args.mode}")
-    trainer.fit(model, train_loader, val_loader)
+    loguru_logger.info(f"Starting Baseline Training: {args.name}")
+    trainer.fit(model, datamodule=data_module)
 
 if __name__ == '__main__':
     main()
