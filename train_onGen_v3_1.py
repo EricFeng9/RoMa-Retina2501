@@ -447,13 +447,8 @@ class MultimodalValidationCallback(Callback):
                 if 'feat_f1' in outputs and outputs['feat_f1'] is not None:
                     visualize_feature_maps(outputs['feat_f1'][i:i+1], save_path / "feat_fine_mov.png", title="Fine Mov")
 
-                # [新增] 适配图可视化 (DINOv2 Input)
-                if 'x_adapted0' in outputs and outputs['x_adapted0'] is not None:
-                    img_ada = (outputs['x_adapted0'][i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                    cv2.imwrite(str(save_path / "adapted_fix.png"), cv2.cvtColor(img_ada, cv2.COLOR_RGB2BGR))
-                if 'x_adapted1' in outputs and outputs['x_adapted1'] is not None:
-                    img_ada = (outputs['x_adapted1'][i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                    cv2.imwrite(str(save_path / "adapted_mov.png"), cv2.cvtColor(img_ada, cv2.COLOR_RGB2BGR))
+                # [Removed] 适配图可视化 (DINOv2 Input)
+                pass
             except: pass
             
         return mses, maces
