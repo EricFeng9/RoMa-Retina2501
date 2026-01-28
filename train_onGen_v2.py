@@ -456,9 +456,24 @@ class DelayedEarlyStopping(EarlyStopping):
     def __init__(self, start_epoch=50, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_epoch = start_epoch
+    
     def on_validation_end(self, trainer, pl_module):
-        if trainer.current_epoch >= self.start_epoch:
-            super().on_validation_end(trainer, pl_module)
+        """只在达到start_epoch后才进行早停检查"""
+        if trainer.current_epoch < self.start_epoch:
+            # 在start_epoch之前，更新best_score但不触发早停
+            logs = trainer.callback_metrics
+            current = logs.get(self.monitor)
+            if current is not None:
+                # 确保best_score被正确初始化和更新
+                if self.best_score is None or self.best_score.isnan():
+                    self.best_score = current
+                elif self.monitor_op(current - self.min_delta, self.best_score.to(current.device)):
+                    self.best_score = current
+                # 重置wait_count，避免在start_epoch之前累积
+                self.wait_count = 0
+            return
+        # 达到start_epoch后，正常执行早停检查
+        super().on_validation_end(trainer, pl_module)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RoMa Baseline Training on Generated Data")
