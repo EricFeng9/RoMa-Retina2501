@@ -16,38 +16,104 @@ class FineMatching(nn.Module):
     def __init__(self, d_model=256, window_size=5):
         super().__init__()
         self.window_size = window_size
+        # 这里采用一个轻量级 CNN，在局部窗口特征上预测 (dx, dy) 偏移。
+        # 输入: [N, 2*d_model, w, w] (fix/mov 的精特征 patch 拼接)
+        # 输出: [N, 2] — 针对每一个粗匹配的亚像素偏移 (以原图像素为单位)。
         self.refine_net = nn.Sequential(
             nn.Conv2d(d_model * 2, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 2, kernel_size=1)  # 输出 (dx, dy) 偏移
+            nn.Conv2d(64, 2, kernel_size=1)
         )
         
-    def forward(self, feat_f0, feat_f1, mkpts0_c, mkpts1_c):
+    def forward(self, feat_f0, feat_f1, mkpts0_c_pix, mkpts1_c_pix, m_bids, img_hw):
         """
         Args:
-            feat_f0: [B, d, H/4, W/4] 精细特征
-            feat_f1: [B, d, H/4, W/4] 精细特征
-            mkpts0_c: [B, N, 2] 粗匹配点 (在原图尺度)
-            mkpts1_c: [B, N, 2] 粗匹配点 (在原图尺度)
+            feat_f0: [B, d, Hf, Wf] 图像0的精细特征 (VGG)
+            feat_f1: [B, d, Hf, Wf] 图像1的精细特征 (VGG)
+            mkpts0_c_pix: [M, 2] 粗匹配点 (image0, 原图像素坐标)
+            mkpts1_c_pix: [M, 2] 粗匹配点 (image1, 原图像素坐标)
+            m_bids: [M] 每个匹配所属的 batch 索引
+            img_hw: (H_img, W_img) 原图尺寸
         Returns:
-            mkpts0_f: [B, N, 2] 精细匹配点
-            mkpts1_f: [B, N, 2] 精细匹配点
+            mkpts0_f: [M, 2] 精细匹配点 (image0)
+            mkpts1_f: [M, 2] 精细匹配点 (image1，已细化)
         """
-        B, d, H, W = feat_f0.shape
-        N = mkpts0_c.shape[1]
+        # 如果没有任何粗匹配，直接返回
+        if mkpts0_c_pix.numel() == 0:
+            return mkpts0_c_pix, mkpts1_c_pix
         
-        # 将坐标缩放到精细特征图尺度
-        scale = torch.tensor([W-1, H-1], device=feat_f0.device)
-        mkpts0_scaled = mkpts0_c / scale * torch.tensor([W-1, H-1], device=feat_f0.device)
-        mkpts1_scaled = mkpts1_c / scale * torch.tensor([W-1, H-1], device=feat_f0.device)
+        B, d, Hf, Wf = feat_f0.shape
+        H_img, W_img = img_hw
+        device = feat_f0.device
+        window_size = self.window_size
+        r = window_size // 2
         
-        # 提取局部窗口特征 (简化版，使用grid_sample)
-        # 这里简化处理：直接返回粗匹配结果
-        # TODO: 实现完整的局部窗口匹配
+        # 1. 预先构建局部窗口的 offset 网格（在特征图归一化坐标系中）
+        # grid_sample 的坐标范围为 [-1, 1]，这里以特征图分辨率为基准，把
+        # 像素偏移 [-r, r] 映射到 [-1, 1] 空间。
+        if Wf > 1:
+            xs = torch.linspace(-r, r, window_size, device=device) * 2.0 / (Wf - 1)
+        else:
+            xs = torch.zeros(window_size, device=device)
+        if Hf > 1:
+            ys = torch.linspace(-r, r, window_size, device=device) * 2.0 / (Hf - 1)
+        else:
+            ys = torch.zeros(window_size, device=device)
+        offset_y, offset_x = torch.meshgrid(ys, xs, indexing='ij')  # [w, w]
+        offset_grid = torch.stack([offset_x, offset_y], dim=-1)     # [w, w, 2]
         
-        return mkpts0_c, mkpts1_c
+        # 2. 对每个 batch 内的匹配，提取局部 patch 并通过 refine_net 预测 (dx, dy)
+        mkpts1_refined = mkpts1_c_pix.clone()
+        
+        for b in range(B):
+            mask_b = (m_bids == b)
+            if mask_b.sum() == 0:
+                continue
+            
+            pts0_b = mkpts0_c_pix[mask_b]  # [Mb, 2]
+            pts1_b = mkpts1_c_pix[mask_b]  # [Mb, 2]
+            Mb = pts0_b.shape[0]
+            
+            # 将原图像素坐标映射到特征图的归一化坐标 [-1, 1]
+            # 这里假设精特征与原图对齐，仅分辨率不同，用 (x/(W_img-1))*2-1 近似
+            x0_norm = (pts0_b[:, 0] / max(W_img - 1, 1e-6)) * 2.0 - 1.0
+            y0_norm = (pts0_b[:, 1] / max(H_img - 1, 1e-6)) * 2.0 - 1.0
+            x1_norm = (pts1_b[:, 0] / max(W_img - 1, 1e-6)) * 2.0 - 1.0
+            y1_norm = (pts1_b[:, 1] / max(H_img - 1, 1e-6)) * 2.0 - 1.0
+            
+            centers0 = torch.stack([x0_norm, y0_norm], dim=-1).view(Mb, 1, 1, 2)  # [Mb,1,1,2]
+            centers1 = torch.stack([x1_norm, y1_norm], dim=-1).view(Mb, 1, 1, 2)
+            
+            grid0 = offset_grid.unsqueeze(0) + centers0  # [Mb, w, w, 2]
+            grid1 = offset_grid.unsqueeze(0) + centers1  # [Mb, w, w, 2]
+            
+            # 为每个匹配复制一份对应 batch 的特征图
+            feat0_b = feat_f0[b].unsqueeze(0).expand(Mb, -1, -1, -1)  # [Mb, d, Hf, Wf]
+            feat1_b = feat_f1[b].unsqueeze(0).expand(Mb, -1, -1, -1)  # [Mb, d, Hf, Wf]
+            
+            # 使用 grid_sample 提取局部窗口特征
+            patches0 = F.grid_sample(
+                feat0_b, grid0, mode='bilinear', align_corners=True
+            )  # [Mb, d, w, w]
+            patches1 = F.grid_sample(
+                feat1_b, grid1, mode='bilinear', align_corners=True
+            )  # [Mb, d, w, w]
+            
+            # 拼接 fix/mov patch，送入 refine_net 得到 (dx, dy)
+            patch_pair = torch.cat([patches0, patches1], dim=1)  # [Mb, 2d, w, w]
+            delta = self.refine_net(patch_pair)                  # [Mb, 2, w, w]
+            delta = delta.mean(dim=[2, 3])                       # [Mb, 2]
+            
+            # 将偏移量看作“原图像素坐标”上的修正（网络会通过 loss_f 自行学习尺度）
+            mkpts1_refined_b = pts1_b + delta
+            mkpts1_refined[mask_b] = mkpts1_refined_b
+        
+        # 目前只对 moving 图像做细化，fix 端保持不变
+        mkpts0_f = mkpts0_c_pix
+        mkpts1_f = mkpts1_refined
+        return mkpts0_f, mkpts1_f
 
 
 class RoMa(nn.Module):
@@ -186,9 +252,10 @@ class RoMa(nn.Module):
         mkpts0_c_pix = mkpts0_c * torch.tensor([W-1, H-1], device=mkpts0_c.device)
         mkpts1_c_pix = mkpts1_c * torch.tensor([W-1, H-1], device=mkpts1_c.device)
         
-        # 4. 精细匹配 (简化版：暂时跳过)
-        mkpts0_f = mkpts0_c_pix
-        mkpts1_f = mkpts1_c_pix
+        # 4. 精细匹配：在 VGG 精特征上做局部窗口细化
+        mkpts0_f, mkpts1_f = self.fine_matching(
+            feat_f0, feat_f1, mkpts0_c_pix, mkpts1_c_pix, b_ids, img_hw=(H, W)
+        )
         
         # 5. 更新 data
         data.update({
